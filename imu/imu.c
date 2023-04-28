@@ -573,21 +573,96 @@ static void imu_read_callback(float *accel, float *gyro, float *mag) {
 		m_gyro[i] -= m_settings.gyro_offsets[i];
 	}
 
+	//Alex changes. Commenting out existing biquad filter process for now.
+
+	// // Apply filters
+	// if(m_settings.accel_lowpass_filter_x > 0){
+	// 	m_accel[0] = biquad_process(&acc_x_biquad, m_accel[0]);
+	// }
+	// if(m_settings.accel_lowpass_filter_y > 0){
+	// 	m_accel[1] = biquad_process(&acc_y_biquad, m_accel[1]);
+	// }
+	// if(m_settings.accel_lowpass_filter_z > 0){
+	// 	m_accel[2] = biquad_process(&acc_z_biquad, m_accel[2]);
+	// }
+	// if(m_settings.gyro_lowpass_filter > 0){
+	// 	m_gyro[0] = biquad_process(&gyro_x_biquad, m_gyro[0]);
+	// 	m_gyro[1] = biquad_process(&gyro_y_biquad, m_gyro[1]);
+	// 	m_gyro[2] = biquad_process(&gyro_z_biquad, m_gyro[2]);
+	// }
+
+
+	// Alex changes. First attempt at recursive estimator (Kalman filter) for gyro and accel.
+	// Note: to get the correct resolotuion for the Kalman gains from VESC Tool,
+	// the filter values are multiplied by .001 here. This is because the VESC Tool doesn't 
+	// allow for decimal values in the filter values, or values below 1.
+	// Typical gains might be between .01 and 10, for instance.
+	// This means a value of 1000 in the VESC tool is equal to 1 in the code, for now.
+
+	float last_m_accel_0;
+	float m_accel_0_filtered;
+	last_m_accel_0=m_accel[0];
+
+
+	float last_m_accel_1;
+	float m_accel_1_filtered;
+	last_m_accel_1=m_accel[1];
+
+
+	float last_m_accel_2;
+	float m_accel_2_filtered;
+	last_m_accel_2=m_accel[2];
+	
+	float last_m_gyro_0;
+	float gyro_0_filtered;
+	last_m_gyro_0=m_gyro[0];
+
+	float last_m_gyro_1;
+	float gyro_1_filtered;
+	last_m_gyro_1=m_gyro[1];
+
+	float last_m_gyro_2;
+	float gyro_2_filtered;
+	last_m_gyro_2=m_gyro[2];
+
 	// Apply filters
 	if(m_settings.accel_lowpass_filter_x > 0){
-		m_accel[0] = biquad_process(&acc_x_biquad, m_accel[0]);
+		m_accel_0_filtered = 0.001*m_settings.accel_lowpass_filter_x*m_accel[0]+(1- 0.001*m_settings.accel_lowpass_filter_x)*(last_m_accel_0);	
+		m_accel[0] = m_accel_0_filtered;											
 	}
 	if(m_settings.accel_lowpass_filter_y > 0){
-		m_accel[1] = biquad_process(&acc_y_biquad, m_accel[1]);
+		m_accel_1_filtered = 0.001* m_settings.accel_lowpass_filter_y*m_accel[1]+(1- 0.001*m_settings.accel_lowpass_filter_y)*(last_m_accel_1);
+		m_accel[1] = m_accel_1_filtered;
 	}
 	if(m_settings.accel_lowpass_filter_z > 0){
-		m_accel[2] = biquad_process(&acc_z_biquad, m_accel[2]);
+		m_accel_2_filtered = 0.001*m_settings.accel_lowpass_filter_z*m_accel[2]+(1- 0.001*m_settings.accel_lowpass_filter_z)*(last_m_accel_2);
+		m_accel[2] = m_accel_2_filtered;
 	}
 	if(m_settings.gyro_lowpass_filter > 0){
-		m_gyro[0] = biquad_process(&gyro_x_biquad, m_gyro[0]);
-		m_gyro[1] = biquad_process(&gyro_y_biquad, m_gyro[1]);
-		m_gyro[2] = biquad_process(&gyro_z_biquad, m_gyro[2]);
+		gyro_0_filtered=0.001*m_settings.gyro_lowpass_filter*m_gyro[0]+(1- 0.001*m_settings.gyro_lowpass_filter)*(last_m_gyro_0);
+		m_gyro[0] = gyro_0_filtered;
+
+		gyro_1_filtered =0.001*m_settings.gyro_lowpass_filter*m_gyro[1]+(1- 0.001*m_settings.gyro_lowpass_filter)*(last_m_gyro_1);
+		m_gyro[1] = gyro_1_filtered;
+
+		gyro_2_filtered=0.001*m_settings.gyro_lowpass_filter*m_gyro[2]+(1- 0.001*m_settings.gyro_lowpass_filter)*(last_m_gyro_2);
+		m_gyro[2] = gyro_2_filtered;
 	}
+		// Xk = Kk * Zk + (1 - Kk) * (Xk-1)
+				// XK= balance_conf.roll_steer_ki*pitch_angle
+
+				// Xk = Current estimation
+
+				// Kk = Kalman gain
+
+				// Zk = Measured value
+
+				// Xk–1 = Previous estimation
+
+
+
+
+
 
 	float gyro_rad[3];
 	gyro_rad[0] = DEG2RAD_f(m_gyro[0]);

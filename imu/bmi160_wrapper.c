@@ -61,11 +61,19 @@ static bool reset_init_bmi(BMI_STATE *s) {
 
 	bmi160_init(&(s->sensor));
 
-	s->sensor.accel_cfg.range = BMI160_ACCEL_RANGE_16G;
+	//Alex changes. Lowered the ranges to 2G and 125DPS. This should give better resolution
+	//for the measuerment ranges we care about for balance boards.
+	//In testing the IMU on the board, I found it hard to get the board to saturate the 2G range
+	// for the accelerometer, and hard to saturate the 125DPS range for the gyro.
+
+
+	s->sensor.accel_cfg.range = BMI160_ACCEL_RANGE_2G;
 	s->sensor.accel_cfg.power = BMI160_ACCEL_NORMAL_MODE;
 
-	s->sensor.gyro_cfg.range = BMI160_GYRO_RANGE_2000_DPS;
+	s->sensor.gyro_cfg.range = BMI160_GYRO_RANGE_125_DPS;
 	s->sensor.gyro_cfg.power = BMI160_GYRO_NORMAL_MODE;
+
+	// Note for other future IMU mods: maybe do any other initilization here????
 
 	if(s->rate_hz <= 25){
 		s->sensor.accel_cfg.odr = BMI160_ACCEL_ODR_25HZ;
@@ -124,7 +132,7 @@ static THD_FUNCTION(bmi_thread, arg) {
 	s->is_running = true;
 
 	systime_t iteration_timer = chVTGetSystemTime();
-	const systime_t desired_interval = US2ST(1000000 / s->rate_hz);
+	const systime_t desired_interval = US2ST(1000000 / s->rate_hz);// this comes from what is programmed in the IMU. 
 
 	for(;;) {
 		struct bmi160_sensor_data accel;
@@ -138,15 +146,19 @@ static THD_FUNCTION(bmi_thread, arg) {
 			continue;
 		}
 
+		//Note: this appears to be the  first manipulation of the IMU data
+
+		// Alex changes. Adjusted full scale range values here as well.
+		
 		float tmp_accel[3], tmp_gyro[3], tmp_mag[3];
 
-		tmp_accel[0] = (float)accel.x * 16.0 / 32768.0;
-		tmp_accel[1] = (float)accel.y * 16.0 / 32768.0;
-		tmp_accel[2] = (float)accel.z * 16.0 / 32768.0;
+		tmp_accel[0] = (float)accel.x * 2.0 / 32768.0;
+		tmp_accel[1] = (float)accel.y * 2.0 / 32768.0;
+		tmp_accel[2] = (float)accel.z * 2.0 / 32768.0;
 
-		tmp_gyro[0] = (float)gyro.x * 2000.0 / 32768.0;
-		tmp_gyro[1] = (float)gyro.y * 2000.0 / 32768.0;
-		tmp_gyro[2] = (float)gyro.z * 2000.0 / 32768.0;
+		tmp_gyro[0] = (float)gyro.x * 125.0 / 32768.0;
+		tmp_gyro[1] = (float)gyro.y * 125.0 / 32768.0;
+		tmp_gyro[2] = (float)gyro.z * 125.0 / 32768.0;
 
 		memset(tmp_mag, 0, sizeof(tmp_mag));
 

@@ -17,6 +17,15 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
     */
 
+
+
+   // Notes need to add back temp limit tilt back, verify tiltbacks work still, and maybe change output from UTILS expo to have same gains as non- expo use. 
+   // Need to clean up code/trim to run fast. Ideally, we would filter IMU data how we want and then down-sample in this code
+   // Right now it seems we are downsampling, and then filtering, which can have aliasing issues.
+   // Biquad filter as implemented seems to be "notchy" feeling in the derriviative term
+   
+
+
 #include "conf_general.h"
 
 #include "ch.h" // ChibiOS
@@ -35,6 +44,7 @@
 #include "digital_filter.h"
 
 
+
 #include <math.h>
 #include <stdio.h>
 
@@ -48,6 +58,8 @@ typedef enum {
 	RUNNING_TILTBACK_DUTY = 2,
 	RUNNING_TILTBACK_HIGH_VOLTAGE = 3,
 	RUNNING_TILTBACK_LOW_VOLTAGE = 4,
+	//Alex Changes. Mitch left space in value 5. Using for high temp tiltback.
+	RUNNING_TILTBACK_HIGHTEMP = 5,
 	FAULT_ANGLE_PITCH = 6,
 	FAULT_ANGLE_ROLL = 7,
 	FAULT_SWITCH_HALF = 8,
@@ -61,6 +73,8 @@ typedef enum {
 	TILTBACK_DUTY,
 	TILTBACK_HV,
 	TILTBACK_LV,
+	// Alex Changes. Addition for temp adjust
+	TILTBACK_HIGHTEMP,
 	TILTBACK_NONE
 } SetpointAdjustmentType;
 
@@ -72,7 +86,7 @@ typedef enum {
 
 // Balance thread
 static THD_FUNCTION(balance_thread, arg);
-static THD_WORKING_AREA(balance_thread_wa, 1024); // 2kb stack for this thread
+static THD_WORKING_AREA(balance_thread_wa, 2048); // 2kb stack for this thread
 
 static thread_t *app_thread;
 
@@ -81,9 +95,17 @@ static volatile balance_config balance_conf;
 static volatile imu_config imu_conf;
 static systime_t loop_time;
 static float startup_step_size;
-static float tiltback_duty_step_size, tiltback_hv_step_size, tiltback_lv_step_size, tiltback_return_step_size;
+//Alex changes. Added for hightemp tiltback stepsize.
+static float tiltback_duty_step_size, tiltback_hv_step_size, tiltback_lv_step_size, tiltback_hightemp_step_size, tiltback_return_step_size;
 static float torquetilt_on_step_size, torquetilt_off_step_size, turntilt_step_size;
 static float tiltback_variable, tiltback_variable_max_erpm, noseangling_step_size;
+
+//Alex Changes.
+//bring in motor configuration settings for maximum current, fet and motor temp limits
+static float fet_temp_limit;
+static float motor_temp_limit;
+
+
 
 // Runtime values read from elsewhere
 static float pitch_angle, last_pitch_angle, roll_angle, abs_roll_angle, abs_roll_angle_sin, last_gyro_y;
@@ -113,6 +135,49 @@ static systime_t fault_angle_pitch_timer, fault_angle_roll_timer, fault_switch_t
 static float d_pt1_lowpass_state, d_pt1_lowpass_k, d_pt1_highpass_state, d_pt1_highpass_k;
 static float motor_timeout;
 static systime_t brake_timeout;
+
+
+// Alex Changes. Added variables. Some of these are not being used at the moment. 
+static float max_motor_current;
+static float pitch_filtered;
+static float last_pitch_filtered;
+static float last_torquetilt_filtered_current;
+static float ReadSensorTimeStamp;
+
+static float erpm_filtered; 
+static float last_erpm_filtered;
+static float last_erpm;
+static float last_duty_cycle;
+
+static float rpm_filtered ;
+static float last_rpm_filtered ;
+static float Kk1;
+static float Xk;
+static float Kk;
+static float last_Xk;
+static float last_proportional_filtered;
+static float proportional_filtered;
+static float adc_lowpass_k;
+static float adc1_lowpass_state;
+static float adc2_lowpass_state;
+static float adc1_filtered ;
+static float adc2_filtered ;
+
+// Alex Changes. Work in progress for non-linear output and variable gain w/speed.
+// re-puposing throttle expo settings from VESC Tool
+// static float imu_angle_exp;
+// static float imu_angle_exp_brake;
+// static float imu_angle_exp_mode;
+//re-purposing speed PID variables from VESC Tool
+//static float psm_x1;
+//static float psm_y1;
+//static float psm_y2;
+//static float psm_y3;
+//static float psm_x2;
+//bool speed_modifier_enable;
+//static float proportional_speed_multiplier;
+//static float previous_ERPM;
+
 
 // Debug values
 static int debug_render_1, debug_render_2;
@@ -147,6 +212,10 @@ void app_balance_configure(balance_config *conf, imu_config *conf2) {
 	turntilt_step_size = balance_conf.turntilt_speed / balance_conf.hertz;
 	noseangling_step_size = balance_conf.noseangling_speed / balance_conf.hertz;
 
+	//Alex changes. Added for higtemp tiltback step size. At the moment it is the same as 
+	//duty tiltback until we can update VESC tool.
+	tiltback_hightemp_step_size = balance_conf.tiltback_duty_speed / balance_conf.hertz;
+
 	// Init Filters
 	if(balance_conf.loop_time_filter > 0){
 		loop_overshoot_alpha = 2*M_PI*((float)1/balance_conf.hertz)*balance_conf.loop_time_filter/(2*M_PI*((float)1/balance_conf.hertz)*balance_conf.loop_time_filter+1);
@@ -164,6 +233,13 @@ void app_balance_configure(balance_config *conf, imu_config *conf2) {
 	if(balance_conf.torquetilt_filter > 0){ // Torquetilt Current Biquad
 		float Fc = balance_conf.torquetilt_filter / balance_conf.hertz;
 		biquad_config(&torquetilt_current_biquad, BQ_LOWPASS, Fc);
+	}
+
+	// Alex changes. Added filter init for ADC switches. Still need to test.
+	if(balance_conf.roll_steer_kp > 0){
+		float dT = 1.0 / balance_conf.hertz;
+		float RC = 1.0 / ( 2.0 * M_PI * balance_conf.roll_steer_kp);
+		adc_lowpass_k =  dT / (RC + dT);
 	}
 
 	// Variable nose angle adjustment / tiltback (setting is per 1000erpm, convert to per erpm)
@@ -257,6 +333,8 @@ static void reset_vars(void){
 	d_pt1_lowpass_state = 0;
 	d_pt1_highpass_state = 0;
 	// Set values for startup
+	rpm_filtered = 0.0;
+    last_rpm_filtered = 0.0;
 	setpoint = pitch_angle;
 	setpoint_target_interpolated = pitch_angle;
 	setpoint_target = 0;
@@ -274,6 +352,15 @@ static void reset_vars(void){
 	last_time = 0;
 	diff_time = 0;
 	brake_timeout = 0;
+	// Alex Changes. Added reset of variables.
+	last_proportional_filtered = 0;
+	proportional_filtered = 0;
+	adc1_lowpass_state =  0 ;
+	adc2_lowpass_state = 0 ;
+	adc1_filtered = 0 ;
+	adc2_filtered = 0;
+	fet_temp_limit=mc_interface_get_configuration()->l_temp_fet_start;
+	motor_temp_limit=mc_interface_get_configuration()->l_temp_motor_start;
 }
 
 static float get_setpoint_adjustment_step_size(void){
@@ -286,6 +373,13 @@ static float get_setpoint_adjustment_step_size(void){
 			return tiltback_hv_step_size;
 		case (TILTBACK_LV):
 			return tiltback_lv_step_size;
+		// Alex changes. Mitch left room for adding something, so I am using it here. 
+		//add hightemp tiltback case. Note this will not show up in the version of 
+		//VESC Tool as the correctly named state, but as an unknown state
+		// until VESC tool can be updated.
+		case (TILTBACK_HIGHTEMP):
+			return tiltback_duty_step_size;
+
 		case (TILTBACK_NONE):
 			return tiltback_return_step_size;
 		default:
@@ -353,6 +447,11 @@ static bool check_faults(bool ignoreTimers){
 }
 
 static void calculate_setpoint_target(void){
+
+	//Alex changes. Added limits from motor configuration and assiged to new variables.
+	// fet_temp_limit=mc_interface_get_configuration()->l_temp_fet_start;
+	// motor_temp_limit=mc_interface_get_configuration()->l_temp_motor_start;
+
 	if(setpointAdjustmentType == CENTERING && setpoint_target_interpolated != setpoint_target){
 		// Ignore tiltback during centering sequence
 		state = RUNNING;
@@ -380,6 +479,22 @@ static void calculate_setpoint_target(void){
 		}
 		setpointAdjustmentType = TILTBACK_LV;
 		state = RUNNING_TILTBACK_LOW_VOLTAGE;
+
+
+	//Alex Changes. Added tiltback for high mosfet or motor temp. 
+	//I am combining the two into one state for now, as I don't think it is so necessary to have two states.
+	// Hardcoding the limits to be 5C below the motor config limits in VESC tool for now.
+	// Would like to change this to user configurable in the future within balance app.
+
+	}else if(mc_interface_temp_fet_filtered() > (fet_temp_limit-5) || mc_interface_temp_motor_filtered() > (motor_temp_limit-5)){  
+		if(erpm > 0){
+			setpoint_target = balance_conf.tiltback_duty_angle;
+		} else {
+			setpoint_target = -balance_conf.tiltback_duty_angle;
+		}
+		setpointAdjustmentType = TILTBACK_HIGHTEMP;
+		state = RUNNING_TILTBACK_HIGHTEMP;
+
 	}else{
 		setpointAdjustmentType = TILTBACK_NONE;
 		setpoint_target = 0;
@@ -543,6 +658,8 @@ static void set_current(float current, float yaw_current){
 	}else if(current < 0 && current < mc_interface_get_configuration()->l_current_min){
 		current = mc_interface_get_configuration()->l_current_min;
 	}
+	// Alex Changes. Had to add this when using the non-linear output to re-scale the current command.
+	max_motor_current=mc_interface_get_configuration()->l_current_max;
 	// Reset the timeout
 	timeout_reset();
 	// Set current
@@ -573,7 +690,7 @@ static THD_FUNCTION(balance_thread, arg) {
 
 	while (!chThdShouldTerminateX()) {
 		// Update times
-		current_time = chVTGetSystemTimeX();
+		current_time = chVTGetSystemTimeX();  //timer count (10,000 = 1sec).
 		if(last_time == 0){
 		  last_time = current_time;
 		}
@@ -592,8 +709,20 @@ static THD_FUNCTION(balance_thread, arg) {
 		// Set "last" values to previous loops values
 		last_pitch_angle = pitch_angle;
 		last_gyro_y = gyro[1];
+		// Alex Changes. Added last_pitch_filtered, last_torquetilt_filtered_current, last_erpm, last_erpm_filtered, last_rpm_filtered, last_duty_cycle, last_Xk, last_proportional_filtered
+		last_pitch_filtered=pitch_filtered;
+		last_torquetilt_filtered_current=torquetilt_filtered_current;
+		last_erpm = erpm;
+		last_erpm_filtered = erpm_filtered;
+		last_rpm_filtered=rpm_filtered;
+		last_duty_cycle=duty_cycle;
+		last_Xk=Xk;
+		last_proportional_filtered=proportional_filtered;
+		
 		// Get the values we want
-		pitch_angle = RAD2DEG_f(imu_get_pitch());
+		float dt = UTILS_AGE_S(ReadSensorTimeStamp); //time elapsed since last sensor read, in seconds.
+		ReadSensorTimeStamp = chVTGetSystemTimeX();
+		pitch_angle = RAD2DEG_f(imu_get_pitch());	//read pitch from sensor cache in AHRS lib
 		roll_angle = RAD2DEG_f(imu_get_roll());
 		abs_roll_angle = fabsf(roll_angle);
 		abs_roll_angle_sin = sinf(DEG2RAD_f(abs_roll_angle));
@@ -618,26 +747,49 @@ static THD_FUNCTION(balance_thread, arg) {
 #else
 		adc2 = 0.0;
 #endif
-
+		
 		// Calculate switch state from ADC values
+		
+		//Alex Changes. I wanted to add some filtering to the ADC values. Still need to test it.
+
+		if(balance_conf.roll_steer_kp > 0){
+					adc1_lowpass_state = adc1_lowpass_state + adc_lowpass_k * (adc1 - adc1_lowpass_state);
+					adc1_filtered = adc1_lowpass_state;
+
+				} 
+				
+				else {
+					adc1_filtered = adc1;
+		}	
+
+
+		if(balance_conf.roll_steer_kp > 0){
+					adc2_lowpass_state = adc2_lowpass_state + adc_lowpass_k  * (adc2 - adc2_lowpass_state);
+					adc2_filtered = adc2_lowpass_state;
+
+				} else {
+					adc2_filtered = adc2;
+		}	
+
 		if(balance_conf.fault_adc1 == 0 && balance_conf.fault_adc2 == 0){ // No Switch
 			switch_state = ON;
 		}else if(balance_conf.fault_adc2 == 0){ // Single switch on ADC1
-			if(adc1 > balance_conf.fault_adc1){
+			if(adc1_filtered > balance_conf.fault_adc1){
 				switch_state = ON;
 			} else {
 				switch_state = OFF;
+				
 			}
 		}else if(balance_conf.fault_adc1 == 0){ // Single switch on ADC2
-			if(adc2 > balance_conf.fault_adc2){
+			if(adc2_filtered > balance_conf.fault_adc2){
 				switch_state = ON;
 			} else {
 				switch_state = OFF;
 			}
 		}else{ // Double switch
-			if(adc1 > balance_conf.fault_adc1 && adc2 > balance_conf.fault_adc2){
+			if(adc1_filtered  > balance_conf.fault_adc1 && adc2_filtered > balance_conf.fault_adc2){
 				switch_state = ON;
-			}else if(adc1 > balance_conf.fault_adc1 || adc2 > balance_conf.fault_adc2){
+			}else if(adc1_filtered  > balance_conf.fault_adc1 || adc2_filtered > balance_conf.fault_adc2){
 				if (balance_conf.fault_is_dual_switch)
 					switch_state = ON;
 				else
@@ -663,6 +815,9 @@ static THD_FUNCTION(balance_thread, arg) {
 			case (RUNNING_TILTBACK_HIGH_VOLTAGE):
 			case (RUNNING_TILTBACK_LOW_VOLTAGE):
 
+			//Alex changes. Adding case for high temp.
+			case (RUNNING_TILTBACK_HIGHTEMP):
+
 				// Check for faults
 				if(check_faults(false)){
 					break;
@@ -676,36 +831,96 @@ static THD_FUNCTION(balance_thread, arg) {
 				apply_torquetilt();
 				apply_turntilt();
 
-				// Do PID maths
-				proportional = setpoint - pitch_angle;
+
+				//Apply Proportional filters for derivative term 
+				if(balance_conf.kd_pt1_lowpass_frequency > 0){
+					d_pt1_lowpass_state = d_pt1_lowpass_state + d_pt1_lowpass_k * (pitch_angle - d_pt1_lowpass_state);
+					pitch_filtered = d_pt1_lowpass_state;
+				} else {
+					pitch_filtered = pitch_angle;
+				}	
+				// // Do PID maths
+				proportional = setpoint - pitch_filtered;
 				// Apply deadzone
 				proportional = apply_deadzone(proportional);
+				// if(balance_conf.kd_pt1_highpass_frequency > 0){
+				// 	d_pt1_highpass_state = d_pt1_highpass_state + d_pt1_highpass_k * (proportional - d_pt1_highpass_state);
+				// 	proportional =  d_pt1_highpass_state;
+				// }
+
 				// Resume real PID maths
 				integral = integral + proportional;
-				derivative = last_pitch_angle - pitch_angle;
-
-				// Apply I term Filter
+				
+					// Apply I term limit
 				if(balance_conf.ki_limit > 0 && fabsf(integral * balance_conf.ki) > balance_conf.ki_limit){
 					integral = balance_conf.ki_limit / balance_conf.ki * SIGN(integral);
 				}
 
-				// Apply D term filters
-				if(balance_conf.kd_pt1_lowpass_frequency > 0){
-					d_pt1_lowpass_state = d_pt1_lowpass_state + d_pt1_lowpass_k * (derivative - d_pt1_lowpass_state);
-					derivative = d_pt1_lowpass_state;
-				}
-				if(balance_conf.kd_pt1_highpass_frequency > 0){
-					d_pt1_highpass_state = d_pt1_highpass_state + d_pt1_highpass_k * (derivative - d_pt1_highpass_state);
-					derivative = derivative - d_pt1_highpass_state;
+
+				// An implementation of the recursive estimator (Kalman filter) described here:
+				// Xk = Kk * Zk + (1 - Kk) * (Xk-1)
+				// Xk = Current estimation
+				// Kk = Kalman gain
+				// Zk = Measured value
+				// Xk–1 = Previous estimation
+
+				//Alex changes: Repurposing the balance_conf.kd_pt1_highpass_frequency variable to be the Kk1 variable
+				// note that it is multiplied by 0.001 to get the resolution we need from VESC Tool.
+				//First type of derivative here, based on the setpoint error, in our case the variable "proportional"
+				// 
+				Kk1= (balance_conf.kd_pt1_highpass_frequency);
+				if(Kk1> 0){
+				proportional_filtered=Kk1*proportional*0.001 +(1-Kk1*0.001)*(last_proportional_filtered);
 				}
 
-				pid_value = (balance_conf.kp * proportional) + (balance_conf.ki * integral) + (balance_conf.kd * derivative);
+				if(fabsf(proportional_filtered)== last_proportional_filtered) {
+					derivative = 0.0;
+				} else {
+					derivative = (proportional_filtered-last_proportional_filtered) / ((dt*2));
+				}
 
+
+				//Alex changes: Repurposing balance_conf.yaw_kp for Kk here. This has the resolution we need from VESC Tool straight up, don't need to multiply by 0.001.
+				//Second type of derivative here, based on the setpoint error, in our case the variable "proportional"
+				Kk= (balance_conf.yaw_kp);
+				if(Kk > 0){
+				Xk= Kk*pitch_angle +(1-Kk)*(last_Xk);
+				}
+
+				if (fabsf(Xk) == last_Xk) {
+				derivative2 = 0.0;
+				} else {
+				derivative2 = (Xk-last_Xk) / ((dt*2));// calculate derivative using pitch angle difference and time difference.
+				}
+
+				// Alex changes. Not using the lowpass filters for D term.
+
+				//Apply D term filters
+				// if(balance_conf.kd_pt1_lowpass_frequency > 0){
+				// 	d_pt1_lowpass_state = d_pt1_lowpass_state + d_pt1_lowpass_k * (derivative - d_pt1_lowpass_state);
+				// 	derivative = d_pt1_lowpass_state;
+				// }
+				// if(balance_conf.kd_pt1_highpass_frequency > 0){
+				// 	d_pt1_highpass_state = d_pt1_highpass_state + d_pt1_highpass_k * (derivative - d_pt1_highpass_state);
+				// 	derivative = derivative - d_pt1_highpass_state;
+				// }
+
+				// Alex changes. There are two types of derivative terms. One is the derivative of the pitch angle, and the other is the derivative of error (the variable "proportional").
+				// I am implementing both here to test which is cleaner. Vedder uses two different methods in the PID speed/position controllers. The reasoning is that the derivative of the error 
+				//may be noisier than the derivative of the motor position/motor speed in his implementation. I am not sure if this is true for our application, since our "error" is relative to
+				// the variable "setpoint", which is not a signal, but a calculated target, typically zero, or whatever the tiltback angle settings are. 
+				// By taking the derivative of the pitch angle directly, this might end up being noisier in our case, since the pitch angle is a signal, and the derivative of a signal is typically noisier.
+				// This implmentation below allows testing both methods for now. Also, I have applied a -1 to the second derivative term, and this is because of the way my IMU is mounted. Be aware that depending	
+				// on the convention of your IMU, this may need to be removed. I need to come up with a foolproof way to fix this in the future, assuming that the second method for the derrivative term is better.
+				// If not, then I will just remove the second derivative term altogether.
+
+				pid_value= (balance_conf.kp * proportional) + (balance_conf.ki * integral) + (balance_conf.kd * derivative) + ((-1)*balance_conf.kd2 * derivative2); 
+																															//WARNING: be aware that this -1 may need to be removed depending on the convention of your IMU.
+																															// If you get this wrong, the controller WILL be unstable.
+				
 				if(balance_conf.pid_mode == BALANCE_PID_MODE_ANGLE_RATE_CASCADE){
 					proportional2 = pid_value - gyro[1];
 					integral2 = integral2 + proportional2;
-					derivative2 = last_gyro_y - gyro[1];
-
 					// Apply I term Filter
 					if(balance_conf.ki_limit > 0 && fabsf(integral2 * balance_conf.ki2) > balance_conf.ki_limit){
 						integral2 = balance_conf.ki_limit / balance_conf.ki2 * SIGN(integral2);
@@ -751,6 +966,20 @@ static THD_FUNCTION(balance_thread, arg) {
 					yaw_last_proportional = yaw_proportional;
 				}
 
+				// Alex Changes: non linear output addition. WARNING: Note that to use as implemented, the gains have to be reduced by 100x. 
+				// I am planning to change this to a more intuitive implementation in the future.
+
+				// imu_angle_exp=balance_conf.yaw_kp;  
+				// imu_angle_exp_brake=balance_conf.yaw_ki ; 
+				// imu_angle_exp_mode=balance_conf.yaw_kd;   
+				
+				
+
+				// if(balance_conf.yaw_kd > -1){
+				// 	pid_value = utils_throttle_curve(pid_value, balance_conf.yaw_kp, balance_conf.yaw_ki, balance_conf.yaw_kd);
+				// 	pid_value = pid_value*max_motor_current;
+				// }	
+
 				// Output to motor
 				set_current(pid_value, yaw_pid_value);
 				break;
@@ -782,6 +1011,7 @@ static THD_FUNCTION(balance_thread, arg) {
 		app_balance_experiment();
 
 		// Delay between loops
+		
 		chThdSleep(loop_time - roundf(filtered_loop_overshoot));
 	}
 
