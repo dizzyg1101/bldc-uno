@@ -163,6 +163,11 @@ static float adc2_lowpass_state;
 static float adc1_filtered ;
 static float adc2_filtered ;
 
+static float roll_angle_filtered;
+static float roll_angle_lowpass_state;
+static float abs_roll_angle_filtered;
+static float roll_angle_lowpass_k;
+
 // Alex Changes. Work in progress for non-linear output and variable gain w/speed.
 // re-puposing throttle expo settings from VESC Tool
 // static float imu_angle_exp;
@@ -240,6 +245,13 @@ void app_balance_configure(balance_config *conf, imu_config *conf2) {
 		float dT = 1.0 / balance_conf.hertz;
 		float RC = 1.0 / ( 2.0 * M_PI * balance_conf.roll_steer_kp);
 		adc_lowpass_k =  dT / (RC + dT);
+	}
+
+
+	if(balance_conf.roll_steer_erpm_kp > 0){
+		float dT = 1.0 / balance_conf.hertz;
+		float RC = 1.0 / ( 2.0 * M_PI * balance_conf.roll_steer_erpm_kp);
+		roll_angle_lowpass_k =  dT / (RC + dT);
 	}
 
 	// Variable nose angle adjustment / tiltback (setting is per 1000erpm, convert to per erpm)
@@ -361,6 +373,9 @@ static void reset_vars(void){
 	adc2_filtered = 0;
 	fet_temp_limit=mc_interface_get_configuration()->l_temp_fet_start;
 	motor_temp_limit=mc_interface_get_configuration()->l_temp_motor_start;
+	roll_angle_filtered = 0;
+	roll_angle_lowpass_state = 0;
+
 }
 
 static float get_setpoint_adjustment_step_size(void){
@@ -574,7 +589,19 @@ static void apply_torquetilt(void){
 
 static void apply_turntilt(void){
 	// Calculate desired angle
-	turntilt_target = abs_roll_angle_sin * balance_conf.turntilt_strength;
+	//turntilt_target = abs_roll_angle_sin * -1*balance_conf.turntilt_strength;
+	//abs_roll_angle
+
+	//Apply roll angle filter 
+				if(balance_conf.roll_steer_erpm_kp > 0){
+					roll_angle_lowpass_state = roll_angle_lowpass_state + roll_angle_lowpass_k * (roll_angle - roll_angle_lowpass_state);
+					roll_angle_filtered = roll_angle_lowpass_state;
+				} else {
+					roll_angle_filtered = roll_angle;
+				}	
+	abs_roll_angle_filtered = fabsf(roll_angle_filtered);
+
+	turntilt_target = abs_roll_angle_filtered * -0.1*balance_conf.turntilt_strength;
 
 	// Apply cutzone
 	if(abs_roll_angle < balance_conf.turntilt_start_angle){
