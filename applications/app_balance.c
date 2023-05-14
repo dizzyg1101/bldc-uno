@@ -43,6 +43,9 @@
 #include "terminal.h"
 #include "digital_filter.h"
 
+//Alex Changes. 
+#include "app.h"
+
 
 
 #include <math.h>
@@ -241,9 +244,9 @@ void app_balance_configure(balance_config *conf, imu_config *conf2) {
 	}
 
 	// Alex changes. Added filter init for ADC switches. Still need to test.
-	if(balance_conf.roll_steer_kp > 0){
+	if(balance_conf.yaw_current_clamp > 0){
 		float dT = 1.0 / balance_conf.hertz;
-		float RC = 1.0 / ( 2.0 * M_PI * balance_conf.roll_steer_kp);
+		float RC = 1.0 / ( 2.0 * M_PI * balance_conf.yaw_current_clamp);
 		adc_lowpass_k =  dT / (RC + dT);
 	}
 
@@ -375,6 +378,7 @@ static void reset_vars(void){
 	motor_temp_limit=mc_interface_get_configuration()->l_temp_motor_start;
 	roll_angle_filtered = 0;
 	roll_angle_lowpass_state = 0;
+	//app_nunchuk_get_decoded_y()=0;
 
 }
 
@@ -513,6 +517,9 @@ static void calculate_setpoint_target(void){
 	}else{
 		setpointAdjustmentType = TILTBACK_NONE;
 		setpoint_target = 0;
+		//setpoint_target= (app_nunchuk_get_decoded_y()*balance_conf.ki2);
+
+		
 		state = RUNNING;
 	}
 }
@@ -557,18 +564,22 @@ static void apply_noseangling(void){
 
 static void apply_torquetilt(void){
 	// Filter current (Biquad)
-	if(balance_conf.torquetilt_filter > 0){
-		torquetilt_filtered_current = biquad_process(&torquetilt_current_biquad, motor_current);
-	}else{
-		torquetilt_filtered_current  = motor_current;
-	}
+	// if(balance_conf.torquetilt_filter > 0){
+	// 	torquetilt_filtered_current = biquad_process(&torquetilt_current_biquad, motor_current);
+	// }else{
+	// 	torquetilt_filtered_current  = motor_current;
+	// }
 
 
 	// Wat is this line O_o
 	// Take abs motor current, subtract start offset, and take the max of that with 0 to get the current above our start threshold (absolute).
 	// Then multiply it by "power" to get our desired angle, and min with the limit to respect boundaries.
 	// Finally multiply it by sign motor current to get directionality back
-	torquetilt_target = fminf(fmaxf((fabsf(torquetilt_filtered_current) - balance_conf.torquetilt_start_current), 0) * balance_conf.torquetilt_strength, balance_conf.torquetilt_angle_limit) * SIGN(torquetilt_filtered_current);
+	//torquetilt_target = fminf(fmaxf((fabsf(torquetilt_filtered_current) - balance_conf.torquetilt_start_current), 0) * balance_conf.torquetilt_strength, balance_conf.torquetilt_angle_limit) * SIGN(torquetilt_filtered_current);
+
+	//torquetilt_target = fminf(fmaxf((app_nunchuk_get_decoded_y()),0) * balance_conf.torquetilt_strength, balance_conf.torquetilt_angle_limit);
+	torquetilt_target = fminf((app_nunchuk_get_decoded_y()) * balance_conf.torquetilt_strength*100, balance_conf.torquetilt_angle_limit);
+
 
 	float step_size;
 	if((torquetilt_interpolated - torquetilt_target > 0 && torquetilt_target > 0) || (torquetilt_interpolated - torquetilt_target < 0 && torquetilt_target < 0)){
@@ -779,7 +790,7 @@ static THD_FUNCTION(balance_thread, arg) {
 		
 		//Alex Changes. I wanted to add some filtering to the ADC values. Still need to test it.
 
-		if(balance_conf.roll_steer_kp > 0){
+		if(balance_conf.yaw_current_clamp> 0){
 					adc1_lowpass_state = adc1_lowpass_state + adc_lowpass_k * (adc1 - adc1_lowpass_state);
 					adc1_filtered = adc1_lowpass_state;
 
@@ -790,7 +801,7 @@ static THD_FUNCTION(balance_thread, arg) {
 		}	
 
 
-		if(balance_conf.roll_steer_kp > 0){
+		if(balance_conf.yaw_current_clamp > 0){
 					adc2_lowpass_state = adc2_lowpass_state + adc_lowpass_k  * (adc2 - adc2_lowpass_state);
 					adc2_filtered = adc2_lowpass_state;
 
@@ -866,6 +877,18 @@ static THD_FUNCTION(balance_thread, arg) {
 				} else {
 					pitch_filtered = pitch_angle;
 				}	
+				
+				// See
+				// http://math.stackexchange.com/questions/297768/how-would-i-create-a-exponential-ramp-function-from-0-0-to-1-1-with-a-single-val
+
+				// Alex Changes. Added non linear term to output. Note for test setup, ki and kp are reversed in the throttle curve function to get the desired output. 
+				// Otherwise, in the app, kp would be for braking and ki is for throttle. Just semantics but easier to think about on the fly for now.
+				
+				if(balance_conf.yaw_kd > -1){
+					pitch_filtered = utils_throttle_curve(pitch_filtered, balance_conf.yaw_ki, balance_conf.yaw_kp, balance_conf.yaw_kd);
+					//pitch_filtered = utils_throttle_curve(pitch_filtered, balance_conf.yaw_kp, balance_conf.yaw_ki, balance_conf.yaw_kd)*balance_conf.roll_steer_kp;
+				}	
+
 				// // Do PID maths
 				proportional = setpoint - pitch_filtered;
 				// Apply deadzone
@@ -907,9 +930,11 @@ static THD_FUNCTION(balance_thread, arg) {
 				}
 
 
-				//Alex changes: Repurposing balance_conf.yaw_kp for Kk here. This has the resolution we need from VESC Tool straight up, don't need to multiply by 0.001.
+				//Alex changes: Repurposing balance_conf.kp2 for Kk here. This has the resolution we need from VESC Tool straight up, don't need to multiply by 0.001.
 				//Second type of derivative here, based on the setpoint error, in our case the variable "proportional"
-				Kk= (balance_conf.yaw_kp);
+				// *after test notes 5-6-23* this derivative seems to be better than the first version in practice.
+
+				Kk= (balance_conf.kp2);
 				if(Kk > 0){
 				Xk= Kk*pitch_angle +(1-Kk)*(last_Xk);
 				}
@@ -945,53 +970,53 @@ static THD_FUNCTION(balance_thread, arg) {
 																															//WARNING: be aware that this -1 may need to be removed depending on the convention of your IMU.
 																															// If you get this wrong, the controller WILL be unstable.
 				
-				if(balance_conf.pid_mode == BALANCE_PID_MODE_ANGLE_RATE_CASCADE){
-					proportional2 = pid_value - gyro[1];
-					integral2 = integral2 + proportional2;
-					// Apply I term Filter
-					if(balance_conf.ki_limit > 0 && fabsf(integral2 * balance_conf.ki2) > balance_conf.ki_limit){
-						integral2 = balance_conf.ki_limit / balance_conf.ki2 * SIGN(integral2);
-					}
+				// if(balance_conf.pid_mode == BALANCE_PID_MODE_ANGLE_RATE_CASCADE){
+				// 	proportional2 = pid_value - gyro[1];
+				// 	integral2 = integral2 + proportional2;
+				// 	// Apply I term Filter
+				// 	if(balance_conf.ki_limit > 0 && fabsf(integral2 * balance_conf.ki2) > balance_conf.ki_limit){
+				// 		integral2 = balance_conf.ki_limit / balance_conf.ki2 * SIGN(integral2);
+				// 	}
 
-					pid_value = (balance_conf.kp2 * proportional2) + (balance_conf.ki2 * integral2) + (balance_conf.kd2 * derivative2);
-				}
+				// 	pid_value = (balance_conf.kp2 * proportional2) + (balance_conf.ki2 * integral2) + (balance_conf.kd2 * derivative2);
+				// }
 
-				last_proportional = proportional;
+				// last_proportional = proportional;
 
-				// Apply Booster
-				abs_proportional = fabsf(proportional);
-				if(abs_proportional > balance_conf.booster_angle){
-					if(abs_proportional - balance_conf.booster_angle < balance_conf.booster_ramp){
-						pid_value += (balance_conf.booster_current * SIGN(proportional)) * ((abs_proportional - balance_conf.booster_angle) / balance_conf.booster_ramp);
-					}else{
-						pid_value += balance_conf.booster_current * SIGN(proportional);
-					}
-				}
+				// // Apply Booster
+				// abs_proportional = fabsf(proportional);
+				// if(abs_proportional > balance_conf.booster_angle){
+				// 	if(abs_proportional - balance_conf.booster_angle < balance_conf.booster_ramp){
+				// 		pid_value += (balance_conf.booster_current * SIGN(proportional)) * ((abs_proportional - balance_conf.booster_angle) / balance_conf.booster_ramp);
+				// 	}else{
+				// 		pid_value += balance_conf.booster_current * SIGN(proportional);
+				// 	}
+				// }
 
-				if(balance_conf.multi_esc){
-					// Calculate setpoint
-					if(abs_duty_cycle < .02){
-						yaw_setpoint = 0;
-					} else if(avg_erpm < 0){
-						yaw_setpoint = (-balance_conf.roll_steer_kp * roll_angle) + (balance_conf.roll_steer_erpm_kp * roll_angle * avg_erpm);
-					} else{
-						yaw_setpoint = (balance_conf.roll_steer_kp * roll_angle) + (balance_conf.roll_steer_erpm_kp * roll_angle * avg_erpm);
-					}
-					// Do PID maths
-					yaw_proportional = yaw_setpoint - gyro[2];
-					yaw_integral = yaw_integral + yaw_proportional;
-					yaw_derivative = yaw_proportional - yaw_last_proportional;
+				// if(balance_conf.multi_esc){
+				// 	// Calculate setpoint
+				// 	if(abs_duty_cycle < .02){
+				// 		yaw_setpoint = 0;
+				// 	} else if(avg_erpm < 0){
+				// 		yaw_setpoint = (-balance_conf.roll_steer_kp * roll_angle) + (balance_conf.roll_steer_erpm_kp * roll_angle * avg_erpm);
+				// 	} else{
+				// 		yaw_setpoint = (balance_conf.roll_steer_kp * roll_angle) + (balance_conf.roll_steer_erpm_kp * roll_angle * avg_erpm);
+				// 	}
+				// 	// Do PID maths
+				// 	yaw_proportional = yaw_setpoint - gyro[2];
+				// 	yaw_integral = yaw_integral + yaw_proportional;
+				// 	yaw_derivative = yaw_proportional - yaw_last_proportional;
 
-					yaw_pid_value = (balance_conf.yaw_kp * yaw_proportional) + (balance_conf.yaw_ki * yaw_integral) + (balance_conf.yaw_kd * yaw_derivative);
+				// 	yaw_pid_value = (balance_conf.yaw_kp * yaw_proportional) + (balance_conf.yaw_ki * yaw_integral) + (balance_conf.yaw_kd * yaw_derivative);
 
-					if(yaw_pid_value > balance_conf.yaw_current_clamp){
-						yaw_pid_value = balance_conf.yaw_current_clamp;
-					}else if(yaw_pid_value < -balance_conf.yaw_current_clamp){
-						yaw_pid_value = -balance_conf.yaw_current_clamp;
-					}
+				// 	if(yaw_pid_value > balance_conf.yaw_current_clamp){
+				// 		yaw_pid_value = balance_conf.yaw_current_clamp;
+				// 	}else if(yaw_pid_value < -balance_conf.yaw_current_clamp){
+				// 		yaw_pid_value = -balance_conf.yaw_current_clamp;
+				// 	}
 
-					yaw_last_proportional = yaw_proportional;
-				}
+				// 	yaw_last_proportional = yaw_proportional;
+				// }
 
 				// Alex Changes: non linear output addition. WARNING: Note that to use as implemented, the gains have to be reduced by 100x. 
 				// I am planning to change this to a more intuitive implementation in the future.

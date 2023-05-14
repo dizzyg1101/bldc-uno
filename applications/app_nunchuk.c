@@ -287,7 +287,8 @@ static THD_FUNCTION(output_thread, arg) {
 		float out_val = app_nunchuk_get_decoded_y();
 		utils_deadband(&out_val, config.hyst, 1.0);
 		out_val = utils_throttle_curve(out_val, config.throttle_exp, config.throttle_exp_brake, config.throttle_exp_mode);
-
+		
+		
 		if (chuck_d.bt_c) {
 			static float pid_rpm = 0.0;
 
@@ -529,8 +530,8 @@ static THD_FUNCTION(output_thread, arg) {
 					}
 				}
 			}
-
-			mc_interface_set_current(current_out);
+			// Alex Changes. Don't want to set current with this app, just use the framework to get the data.
+			//mc_interface_set_current(current_out);
 		}
 	}
 }
