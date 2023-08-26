@@ -42,6 +42,7 @@
 #include "comm_can.h"
 #include "terminal.h"
 #include "digital_filter.h"
+#include "stdlib.h"
 
 //Alex Changes. 
 #include "app.h"
@@ -93,6 +94,21 @@ static THD_WORKING_AREA(balance_thread_wa, 2048); // 2kb stack for this thread
 
 static thread_t *app_thread;
 
+// adding pitch angle buffer
+
+#define DATA_BUFFER_SIZE 20
+#define Derivative_DATA_BUFFER_SIZE 6
+float pitchAngleBuffer[DATA_BUFFER_SIZE];
+float smoothed_data[Derivative_DATA_BUFFER_SIZE]; // 
+float SG_smoothed_data[DATA_BUFFER_SIZE]; // Declare the array outside main
+
+
+int pitchBufferIndex = 0;
+
+#define WINDOW_SIZE 3 // Size of the filtering window (odd number)
+#define POLY_DEGREE 2 // Degree of the fitting polynomial
+
+
 // Config values
 static volatile balance_config balance_conf;
 static volatile imu_config imu_conf;
@@ -122,16 +138,23 @@ static SwitchState switch_state;
 
 // Rumtime state values
 static BalanceState state;
-static float proportional, integral, derivative, proportional2, integral2, derivative2;
-static float last_proportional, abs_proportional;
+static float proportional, integral, derivative,  integral2, derivative2; //proportional2;
+static float last_proportional;// abs_proportional;
 static float pid_value;
+static float pid_value_1;
+static float LP_pitch;
+static float last_LP_pitch;
+static float last_derivative2_filtered;
+static float derivative2_filtered;
+//static float SG_smoothed_data;
+//static float dt;
 static float setpoint, setpoint_target, setpoint_target_interpolated;
 static float noseangling_interpolated;
 static float torquetilt_filtered_current, torquetilt_target, torquetilt_interpolated;
 static Biquad torquetilt_current_biquad;
 static float turntilt_target, turntilt_interpolated;
 static SetpointAdjustmentType setpointAdjustmentType;
-static float yaw_proportional, yaw_integral, yaw_derivative, yaw_last_proportional, yaw_pid_value, yaw_setpoint;
+static float  yaw_integral,  yaw_last_proportional, yaw_pid_value, yaw_setpoint; // yaw_derivative yaw_proportional;
 static systime_t current_time, last_time, diff_time, loop_overshoot;
 static float filtered_loop_overshoot, loop_overshoot_alpha, filtered_diff_time;
 static systime_t fault_angle_pitch_timer, fault_angle_roll_timer, fault_switch_timer, fault_switch_half_timer, fault_duty_timer;
@@ -146,7 +169,9 @@ static float pitch_filtered;
 static float last_pitch_filtered;
 static float last_torquetilt_filtered_current;
 static float ReadSensorTimeStamp;
-
+//static float average_pitch_angle;
+//static float centralDifference;
+static float dt_check;
 static float erpm_filtered; 
 static float last_erpm_filtered;
 static float last_erpm;
@@ -168,7 +193,7 @@ static float adc2_filtered ;
 
 static float roll_angle_filtered;
 static float roll_angle_lowpass_state;
-static float abs_roll_angle_filtered;
+//static float abs_roll_angle_filtered;
 static float roll_angle_lowpass_k;
 
 // Alex Changes. Work in progress for non-linear output and variable gain w/speed.
@@ -206,6 +231,7 @@ void app_balance_configure(balance_config *conf, imu_config *conf2) {
 	balance_conf = *conf;
 	imu_conf = *conf2;
 	// Set calculated values from config
+	balance_conf.hertz= balance_conf.hertz;
 	loop_time = US2ST((int)((1000.0 / balance_conf.hertz) * 1000.0));
 
 	motor_timeout = ((1000.0 / balance_conf.hertz)/1000.0) * 20; // Times 20 for a nice long grace period
@@ -381,6 +407,40 @@ static void reset_vars(void){
 	//app_nunchuk_get_decoded_y()=0;
 
 }
+// Function to apply a simple moving average filter
+
+
+// 	static float simpleMovingAverage(float *buffer, int length) {
+//     float sum = 0;
+//     for (int i = 0; i < length; i++) {
+//         sum += buffer[i];
+//     }
+//     return sum / length;
+// }
+
+
+
+// #define ALPHA 0.1 // Smoothing factor (adjust as needed)
+// #define ORDER 4   // Filter order (higher order for more aggressive filtering)
+
+// float higherOrderLowPassFilter(float input, float *previousValues, int order) {
+//     for (int i = 0; i < order - 1; i++) {
+//         previousValues[i] = previousValues[i + 1];
+//     }
+//     previousValues[order - 1] = input;
+
+//     float output = 0;
+//     for (int i = 0; i < order; i++) {
+//         output += previousValues[i];
+//     }
+//     output /= order;
+
+//     return output;
+// }
+
+
+  
+
 
 static float get_setpoint_adjustment_step_size(void){
 	switch(setpointAdjustmentType){
@@ -546,10 +606,10 @@ static void apply_noseangling(void){
 		noseangling_target = tiltback_variable * erpm;
 	}
 
-	if(erpm > balance_conf.tiltback_constant_erpm){
-		noseangling_target += balance_conf.tiltback_constant;
-	} else if(erpm < -balance_conf.tiltback_constant_erpm){
+	if(erpm < balance_conf.tiltback_constant_erpm){
 		noseangling_target += -balance_conf.tiltback_constant;
+	} else if(erpm > -balance_conf.tiltback_constant_erpm){
+		noseangling_target += balance_conf.tiltback_constant;
 	}
 
 	if(fabsf(noseangling_target - noseangling_interpolated) < noseangling_step_size){
@@ -562,109 +622,126 @@ static void apply_noseangling(void){
 	setpoint += noseangling_interpolated;
 }
 
-static void apply_torquetilt(void){
-	// Filter current (Biquad)
-	// if(balance_conf.torquetilt_filter > 0){
-	// 	torquetilt_filtered_current = biquad_process(&torquetilt_current_biquad, motor_current);
-	// }else{
-	// 	torquetilt_filtered_current  = motor_current;
-	// }
+// static void apply_torquetilt(void){
+// 	// Filter current (Biquad)
+// 	// if(balance_conf.torquetilt_filter > 0){
+// 	// 	torquetilt_filtered_current = biquad_process(&torquetilt_current_biquad, motor_current);
+// 	// }else{
+// 	// 	torquetilt_filtered_current  = motor_current;
+// 	// }
 
 
-	// Wat is this line O_o
-	// Take abs motor current, subtract start offset, and take the max of that with 0 to get the current above our start threshold (absolute).
-	// Then multiply it by "power" to get our desired angle, and min with the limit to respect boundaries.
-	// Finally multiply it by sign motor current to get directionality back
-	//torquetilt_target = fminf(fmaxf((fabsf(torquetilt_filtered_current) - balance_conf.torquetilt_start_current), 0) * balance_conf.torquetilt_strength, balance_conf.torquetilt_angle_limit) * SIGN(torquetilt_filtered_current);
+// 	// Wat is this line O_o
+// 	// Take abs motor current, subtract start offset, and take the max of that with 0 to get the current above our start threshold (absolute).
+// 	// Then multiply it by "power" to get our desired angle, and min with the limit to respect boundaries.
+// 	// Finally multiply it by sign motor current to get directionality back
+// 	//torquetilt_target = fminf(fmaxf((fabsf(torquetilt_filtered_current) - balance_conf.torquetilt_start_current), 0) * balance_conf.torquetilt_strength, balance_conf.torquetilt_angle_limit) * SIGN(torquetilt_filtered_current);
 
-	//torquetilt_target = fminf(fmaxf((app_nunchuk_get_decoded_y()),0) * balance_conf.torquetilt_strength, balance_conf.torquetilt_angle_limit);
-	torquetilt_target = fminf((app_nunchuk_get_decoded_y()) * balance_conf.torquetilt_strength*100, balance_conf.torquetilt_angle_limit);
+// 	//torquetilt_target = fminf(fmaxf((app_nunchuk_get_decoded_y()),0) * balance_conf.torquetilt_strength, balance_conf.torquetilt_angle_limit);
+// 	torquetilt_target = fminf((app_nunchuk_get_decoded_y()) * balance_conf.torquetilt_strength*100, balance_conf.torquetilt_angle_limit);
 
 
-	float step_size;
-	if((torquetilt_interpolated - torquetilt_target > 0 && torquetilt_target > 0) || (torquetilt_interpolated - torquetilt_target < 0 && torquetilt_target < 0)){
-		step_size = torquetilt_off_step_size;
-	}else{
-		step_size = torquetilt_on_step_size;
-	}
+// 	float step_size;
+// 	if((torquetilt_interpolated - torquetilt_target > 0 && torquetilt_target > 0) || (torquetilt_interpolated - torquetilt_target < 0 && torquetilt_target < 0)){
+// 		step_size = torquetilt_off_step_size;
+// 	}else{
+// 		step_size = torquetilt_on_step_size;
+// 	}
 
-	if(fabsf(torquetilt_target - torquetilt_interpolated) < step_size){
-		torquetilt_interpolated = torquetilt_target;
-	}else if (torquetilt_target - torquetilt_interpolated > 0){
-		torquetilt_interpolated += step_size;
-	}else{
-		torquetilt_interpolated -= step_size;
-	}
-	setpoint += torquetilt_interpolated;
+// 	if(fabsf(torquetilt_target - torquetilt_interpolated) < step_size){
+// 		torquetilt_interpolated = torquetilt_target;
+// 	}else if (torquetilt_target - torquetilt_interpolated > 0){
+// 		torquetilt_interpolated += step_size;
+// 	}else{
+// 		torquetilt_interpolated -= step_size;
+// 	}
+// 	setpoint += torquetilt_interpolated;
+// }
+
+// static void apply_turntilt(void){
+// 	// Calculate desired angle
+// 	//turntilt_target = abs_roll_angle_sin * -1*balance_conf.turntilt_strength;
+// 	//abs_roll_angle
+
+// 	//Apply roll angle filter 
+// 				if(balance_conf.roll_steer_erpm_kp > 0){
+// 					roll_angle_lowpass_state = roll_angle_lowpass_state + roll_angle_lowpass_k * (roll_angle - roll_angle_lowpass_state);
+// 					roll_angle_filtered = roll_angle_lowpass_state;
+// 				} else {
+// 					roll_angle_filtered = roll_angle;
+// 				}	
+// 	abs_roll_angle_filtered = fabsf(roll_angle_filtered);
+
+// 	turntilt_target = abs_roll_angle_filtered * -0.1*balance_conf.turntilt_strength;
+
+// 	// Apply cutzone
+// 	if(abs_roll_angle < balance_conf.turntilt_start_angle){
+// 		turntilt_target = 0;
+// 	}
+
+// 	// Disable below erpm threshold otherwise add directionality
+// 	if(abs_erpm < balance_conf.turntilt_start_erpm){
+// 		turntilt_target = 0;
+// 	}else {
+// 		turntilt_target *= SIGN(erpm);
+// 	}
+
+// 	// Apply speed scaling
+// 	if(abs_erpm < balance_conf.turntilt_erpm_boost_end){
+// 		turntilt_target *= 1 + ((balance_conf.turntilt_erpm_boost/100.0f) * (abs_erpm / balance_conf.turntilt_erpm_boost_end));
+// 	}else{
+// 		turntilt_target *= 1 + (balance_conf.turntilt_erpm_boost/100.0f);
+// 	}
+
+// 	// Limit angle to max angle
+// 	if(turntilt_target > 0){
+// 		turntilt_target = fminf(turntilt_target, balance_conf.turntilt_angle_limit);
+// 	}else{
+// 		turntilt_target = fmaxf(turntilt_target, -balance_conf.turntilt_angle_limit);
+// 	}
+
+// 	// Move towards target limited by max speed
+// 	if(fabsf(turntilt_target - turntilt_interpolated) < turntilt_step_size){
+// 		turntilt_interpolated = turntilt_target;
+// 	}else if (turntilt_target - turntilt_interpolated > 0){
+// 		turntilt_interpolated += turntilt_step_size;
+// 	}else{
+// 		turntilt_interpolated -= turntilt_step_size;
+// 	}
+// 	setpoint += turntilt_interpolated;
+
+// }
+
+// static float apply_deadzone(float error){
+// 	if(balance_conf.deadzone == 0){
+// 		return error;
+// 	}
+
+// 	if(error < balance_conf.deadzone && error > -balance_conf.deadzone){
+// 		return 0;
+// 	} else if(error > balance_conf.deadzone){
+// 		return error - balance_conf.deadzone;
+// 	} else {
+// 		return error + balance_conf.deadzone;
+// 	}
+// }
+// // Function to calculate the dynamic deadband output
+static float apply_deadzone(float error) {
+    if (balance_conf.deadzone == 0) {
+        return error;
+    }
+
+    if (error < -balance_conf.deadzone / 2 || error > balance_conf.deadzone / 2) {
+        if (error > 0) {
+            return error - balance_conf.deadzone / 2;
+        } else {
+            return error + balance_conf.deadzone / 2;
+        }
+    } else {
+        return 0;
+    }
 }
 
-static void apply_turntilt(void){
-	// Calculate desired angle
-	//turntilt_target = abs_roll_angle_sin * -1*balance_conf.turntilt_strength;
-	//abs_roll_angle
-
-	//Apply roll angle filter 
-				if(balance_conf.roll_steer_erpm_kp > 0){
-					roll_angle_lowpass_state = roll_angle_lowpass_state + roll_angle_lowpass_k * (roll_angle - roll_angle_lowpass_state);
-					roll_angle_filtered = roll_angle_lowpass_state;
-				} else {
-					roll_angle_filtered = roll_angle;
-				}	
-	abs_roll_angle_filtered = fabsf(roll_angle_filtered);
-
-	turntilt_target = abs_roll_angle_filtered * -0.1*balance_conf.turntilt_strength;
-
-	// Apply cutzone
-	if(abs_roll_angle < balance_conf.turntilt_start_angle){
-		turntilt_target = 0;
-	}
-
-	// Disable below erpm threshold otherwise add directionality
-	if(abs_erpm < balance_conf.turntilt_start_erpm){
-		turntilt_target = 0;
-	}else {
-		turntilt_target *= SIGN(erpm);
-	}
-
-	// Apply speed scaling
-	if(abs_erpm < balance_conf.turntilt_erpm_boost_end){
-		turntilt_target *= 1 + ((balance_conf.turntilt_erpm_boost/100.0f) * (abs_erpm / balance_conf.turntilt_erpm_boost_end));
-	}else{
-		turntilt_target *= 1 + (balance_conf.turntilt_erpm_boost/100.0f);
-	}
-
-	// Limit angle to max angle
-	if(turntilt_target > 0){
-		turntilt_target = fminf(turntilt_target, balance_conf.turntilt_angle_limit);
-	}else{
-		turntilt_target = fmaxf(turntilt_target, -balance_conf.turntilt_angle_limit);
-	}
-
-	// Move towards target limited by max speed
-	if(fabsf(turntilt_target - turntilt_interpolated) < turntilt_step_size){
-		turntilt_interpolated = turntilt_target;
-	}else if (turntilt_target - turntilt_interpolated > 0){
-		turntilt_interpolated += turntilt_step_size;
-	}else{
-		turntilt_interpolated -= turntilt_step_size;
-	}
-	setpoint += turntilt_interpolated;
-
-}
-
-static float apply_deadzone(float error){
-	if(balance_conf.deadzone == 0){
-		return error;
-	}
-
-	if(error < balance_conf.deadzone && error > -balance_conf.deadzone){
-		return 0;
-	} else if(error > balance_conf.deadzone){
-		return error - balance_conf.deadzone;
-	} else {
-		return error + balance_conf.deadzone;
-	}
-}
 
 static void brake(void){
 	// Brake timeout logic
@@ -756,11 +833,28 @@ static THD_FUNCTION(balance_thread, arg) {
 		last_duty_cycle=duty_cycle;
 		last_Xk=Xk;
 		last_proportional_filtered=proportional_filtered;
-		
+		last_LP_pitch=LP_pitch;
+		last_derivative2_filtered=derivative2_filtered;
 		// Get the values we want
 		float dt = UTILS_AGE_S(ReadSensorTimeStamp); //time elapsed since last sensor read, in seconds.
+		dt_check=dt;
 		ReadSensorTimeStamp = chVTGetSystemTimeX();
 		pitch_angle = RAD2DEG_f(imu_get_pitch());	//read pitch from sensor cache in AHRS lib
+
+		
+		
+
+
+		// pitchAngleBuffer[pitchBufferIndex] = pitch_angle;
+		// pitchBufferIndex = (pitchBufferIndex + 1) % DATA_BUFFER_SIZE;
+		// Apply the higher-order low-pass filter
+		//LP_pitch = higherOrderLowPassFilter(pitch_angle, pitchAngleBuffer, ORDER);
+
+		// pitch_angle=LP_pitch;
+		//pitch_angle=simpleMovingAverage( pitchAngleBuffer , DATA_BUFFER_SIZE);
+		
+		
+
 		roll_angle = RAD2DEG_f(imu_get_roll());
 		abs_roll_angle = fabsf(roll_angle);
 		abs_roll_angle_sin = sinf(DEG2RAD_f(abs_roll_angle));
@@ -790,44 +884,44 @@ static THD_FUNCTION(balance_thread, arg) {
 		
 		//Alex Changes. I wanted to add some filtering to the ADC values. Still need to test it.
 
-		if(balance_conf.yaw_current_clamp> 0){
-					adc1_lowpass_state = adc1_lowpass_state + adc_lowpass_k * (adc1 - adc1_lowpass_state);
-					adc1_filtered = adc1_lowpass_state;
+		// if(balance_conf.yaw_current_clamp> 0){
+		// 			adc1_lowpass_state = adc1_lowpass_state + adc_lowpass_k * (adc1 - adc1_lowpass_state);
+		// 			adc1_filtered = adc1_lowpass_state;
 
-				} 
+		// 		} 
 				
-				else {
-					adc1_filtered = adc1;
-		}	
+		// 		else {
+		// 			adc1_filtered = adc1;
+		// }	
 
 
-		if(balance_conf.yaw_current_clamp > 0){
-					adc2_lowpass_state = adc2_lowpass_state + adc_lowpass_k  * (adc2 - adc2_lowpass_state);
-					adc2_filtered = adc2_lowpass_state;
+		// if(balance_conf.yaw_current_clamp > 0){
+		// 			adc2_lowpass_state = adc2_lowpass_state + adc_lowpass_k  * (adc2 - adc2_lowpass_state);
+		// 			adc2_filtered = adc2_lowpass_state;
 
-				} else {
-					adc2_filtered = adc2;
-		}	
+		// 		} else {
+		// 			adc2_filtered = adc2;
+		// }
 
 		if(balance_conf.fault_adc1 == 0 && balance_conf.fault_adc2 == 0){ // No Switch
 			switch_state = ON;
 		}else if(balance_conf.fault_adc2 == 0){ // Single switch on ADC1
-			if(adc1_filtered > balance_conf.fault_adc1){
+			if(adc1 > balance_conf.fault_adc1){
 				switch_state = ON;
 			} else {
 				switch_state = OFF;
 				
 			}
 		}else if(balance_conf.fault_adc1 == 0){ // Single switch on ADC2
-			if(adc2_filtered > balance_conf.fault_adc2){
+			if(adc2 > balance_conf.fault_adc2){
 				switch_state = ON;
 			} else {
 				switch_state = OFF;
 			}
 		}else{ // Double switch
-			if(adc1_filtered  > balance_conf.fault_adc1 && adc2_filtered > balance_conf.fault_adc2){
+			if(adc1  > balance_conf.fault_adc1 && adc2 > balance_conf.fault_adc2){
 				switch_state = ON;
-			}else if(adc1_filtered  > balance_conf.fault_adc1 || adc2_filtered > balance_conf.fault_adc2){
+			}else if(adc1  > balance_conf.fault_adc1 || adc2 > balance_conf.fault_adc2){
 				if (balance_conf.fault_is_dual_switch)
 					switch_state = ON;
 				else
@@ -866,18 +960,18 @@ static THD_FUNCTION(balance_thread, arg) {
 				calculate_setpoint_interpolated();
 				setpoint = setpoint_target_interpolated;
 				apply_noseangling();
-				apply_torquetilt();
-				apply_turntilt();
+				// apply_torquetilt();
+				// apply_turntilt();
 
 
 				//Apply Proportional filters for derivative term 
-				if(balance_conf.kd_pt1_lowpass_frequency > 0){
-					d_pt1_lowpass_state = d_pt1_lowpass_state + d_pt1_lowpass_k * (pitch_angle - d_pt1_lowpass_state);
-					pitch_filtered = d_pt1_lowpass_state;
-				} else {
-					pitch_filtered = pitch_angle;
-				}	
-				
+				// if(balance_conf.kd_pt1_lowpass_frequency > 0){
+				// 	d_pt1_lowpass_state = d_pt1_lowpass_state + d_pt1_lowpass_k * (pitch_angle - d_pt1_lowpass_state);
+				// 	pitch_filtered = d_pt1_lowpass_state;
+				// } else {
+				// 	pitch_filtered = pitch_angle;
+				// }	
+				pitch_filtered = pitch_angle;
 				// See
 				// http://math.stackexchange.com/questions/297768/how-would-i-create-a-exponential-ramp-function-from-0-0-to-1-1-with-a-single-val
 
@@ -887,6 +981,8 @@ static THD_FUNCTION(balance_thread, arg) {
 				if(balance_conf.yaw_kd > -1){
 					pitch_filtered = utils_throttle_curve(pitch_filtered, balance_conf.yaw_ki, balance_conf.yaw_kp, balance_conf.yaw_kd);
 					//pitch_filtered = utils_throttle_curve(pitch_filtered, balance_conf.yaw_kp, balance_conf.yaw_ki, balance_conf.yaw_kd)*balance_conf.roll_steer_kp;
+				} else {
+					pitch_filtered = pitch_angle;
 				}	
 
 				// // Do PID maths
@@ -907,43 +1003,103 @@ static THD_FUNCTION(balance_thread, arg) {
 				}
 
 
+
+				//float previousValues[ORDER] = {0};
+
+				
+				derivative = (LP_pitch-last_LP_pitch) / ((dt*2));
+
+
 				// An implementation of the recursive estimator (Kalman filter) described here:
+
+				//https://kuscholarworks.ku.edu/bitstream/handle/1808/14535/Lindsey_ku_0099M_13455_DATA_1.pdf;sequence=1
 				// Xk = Kk * Zk + (1 - Kk) * (Xk-1)
 				// Xk = Current estimation
 				// Kk = Kalman gain
 				// Zk = Measured value
 				// Xk–1 = Previous estimation
 
+				// 				The filter is the basic form of a one-dimensional time-update step in a discrete-time Kalman filter. 
+				// It's used to estimate the state of a system based on measurements while incorporating a balance between the prediction from the previous 
+				// estimation and the correction from the new measurement.
+
+				// // - **Xk**: This is the current state estimate. It combines the prediction from the previous 
+				// estimate with the correction based on the newly obtained measurement.
+
+				// // - **Kk**: This is the Kalman gain for the current time step. The Kalman gain determines the
+				//  weight given to the measurement correction versus the prediction from the previous estimate. It is computed using the error covariance of the prediction and the error covariance of the measurement.
+
+				// // - **Zk**: This is the measured value at the current time step. It provides new information 
+				// about the true state of the system.
+
+				// // - **Xk–1**: This is the previous state estimate. It's the estimate from the previous time step
+				//  before incorporating the new measurement.
+
+				// // The formula essentially combines the predicted state from the previous estimate with the measured value using
+				//  the Kalman gain. The Kalman gain determines the balance between trusting the prediction and trusting the measurement.
+				//  If the measurement is noisy or uncertain, the Kalman gain will be lower, 
+				//  placing more weight on the prediction. Conversely, if the measurement is very accurate, 
+				//  the Kalman gain will be higher, placing more weight on the measurement.
+
+
+
 				//Alex changes: Repurposing the balance_conf.kd_pt1_highpass_frequency variable to be the Kk1 variable
 				// note that it is multiplied by 0.001 to get the resolution we need from VESC Tool.
 				//First type of derivative here, based on the setpoint error, in our case the variable "proportional"
 				// 
-				Kk1= (balance_conf.kd_pt1_highpass_frequency);
-				if(Kk1> 0){
-				proportional_filtered=Kk1*proportional*0.001 +(1-Kk1*0.001)*(last_proportional_filtered);
-				}
 
-				if(fabsf(proportional_filtered)== last_proportional_filtered) {
-					derivative = 0.0;
-				} else {
-					derivative = (proportional_filtered-last_proportional_filtered) / ((dt*2));
-				}
+
+				// Kk1= (balance_conf.kd_pt1_highpass_frequency);
+				// if(Kk1> 0){
+				// proportional_filtered=Kk1*proportional*0.001 +(1-Kk1*0.001)*(last_proportional_filtered);
+				// }
+
+				// if(fabsf(proportional_filtered)== last_proportional_filtered) {
+				// 	derivative = 0.0;
+				// } else {
+				// 	derivative = (proportional_filtered-last_proportional_filtered) / ((dt*2));
+				// }
 
 
 				//Alex changes: Repurposing balance_conf.kp2 for Kk here. This has the resolution we need from VESC Tool straight up, don't need to multiply by 0.001.
 				//Second type of derivative here, based on the setpoint error, in our case the variable "proportional"
 				// *after test notes 5-6-23* this derivative seems to be better than the first version in practice.
+				
+
+			
+
+
+
+
+
+
 
 				Kk= (balance_conf.kp2);
 				if(Kk > 0){
 				Xk= Kk*pitch_angle +(1-Kk)*(last_Xk);
+				} else {
+				 Xk=pitch_angle;
+				}	
+
+				derivative2 = (Xk-last_Xk) / ((dt*2));// calculate derivative using pitch angle difference and time difference.
+				
+				//Apply Proportional filters for derivative term 
+				if(balance_conf.kd_pt1_lowpass_frequency > 0){
+					d_pt1_lowpass_state = d_pt1_lowpass_state + d_pt1_lowpass_k * (derivative2 - d_pt1_lowpass_state);
+					derivative2 = d_pt1_lowpass_state;
+				} else {
+					derivative2 = derivative2;
+				}	
+				
+
+				Kk1= (balance_conf.ki2);
+				if(Kk1> 0){
+				derivative2_filtered=Kk1*derivative2*0.001 +(1-Kk1*0.001)*(last_derivative2_filtered);
+				derivative2=derivative2_filtered;
+				} else {
+					derivative2 = derivative2;
 				}
 
-				if (fabsf(Xk) == last_Xk) {
-				derivative2 = 0.0;
-				} else {
-				derivative2 = (Xk-last_Xk) / ((dt*2));// calculate derivative using pitch angle difference and time difference.
-				}
 
 				// Alex changes. Not using the lowpass filters for D term.
 
@@ -966,10 +1122,23 @@ static THD_FUNCTION(balance_thread, arg) {
 				// on the convention of your IMU, this may need to be removed. I need to come up with a foolproof way to fix this in the future, assuming that the second method for the derrivative term is better.
 				// If not, then I will just remove the second derivative term altogether.
 
-				pid_value= (balance_conf.kp * proportional) + (balance_conf.ki * integral) + (balance_conf.kd * derivative) + ((-1)*balance_conf.kd2 * derivative2); 
+				pid_value_1= (balance_conf.kp * proportional) + (balance_conf.ki * integral) + (balance_conf.kd * derivative) + ((-1)*balance_conf.kd2 * derivative2); 
 																															//WARNING: be aware that this -1 may need to be removed depending on the convention of your IMU.
 																															// If you get this wrong, the controller WILL be unstable.
 				
+
+				if(balance_conf.kd_pt1_highpass_frequency > 0){
+					d_pt1_highpass_state = d_pt1_highpass_state + d_pt1_highpass_k * (pid_value_1 - d_pt1_highpass_state);
+					pid_value = d_pt1_highpass_state;
+				} else {
+				 pid_value=pid_value_1;
+				}	
+
+
+	
+
+
+
 				// if(balance_conf.pid_mode == BALANCE_PID_MODE_ANGLE_RATE_CASCADE){
 				// 	proportional2 = pid_value - gyro[1];
 				// 	integral2 = integral2 + proportional2;
@@ -1147,25 +1316,25 @@ static void terminal_experiment(int argc, const char **argv) {
 static float app_balance_get_debug(int index){
 	switch(index){
 		case(1):
-			return motor_position;
+			return derivative2;
 		case(2):
-			return setpoint;
+			return  derivative;
 		case(3):
-			return torquetilt_filtered_current;
+			return pitch_angle;
 		case(4):
-			return derivative;
+			return LP_pitch;
 		case(5):
 			return last_pitch_angle - pitch_angle;
 		case(6):
 			return motor_current;
 		case(7):
-			return erpm;
+			return pid_value;
 		case(8):
-			return abs_erpm;
+			return pid_value_1;
 		case(9):
-			return loop_time;
+			return dt_check;
 		case(10):
-			return diff_time;
+			return proportional;
 		case(11):
 			return loop_overshoot;
 		case(12):
