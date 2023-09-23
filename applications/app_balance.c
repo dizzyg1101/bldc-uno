@@ -96,15 +96,29 @@ static thread_t *app_thread;
 
 // adding pitch angle buffer
 
-#define DATA_BUFFER_SIZE 20
-#define Derivative_DATA_BUFFER_SIZE 6
+#define DATA_BUFFER_SIZE 4
+#define Derivative_DATA_BUFFER_SIZE 50
+
+// #define RPM_FILTER_SAMPLES 10
+// #define ACCELX_FILTER_SAMPLES 10
+
+#define ADC1_BUFFER_SIZE 25
+#define ADC2_BUFFER_SIZE 25
+
 float pitchAngleBuffer[DATA_BUFFER_SIZE];
 float smoothed_data[Derivative_DATA_BUFFER_SIZE]; // 
 float SG_smoothed_data[DATA_BUFFER_SIZE]; // Declare the array outside main
 
+float adc1Buffer[ADC1_BUFFER_SIZE];
+float adc2Buffer[ADC2_BUFFER_SIZE];
 
+//float erpm_derivativeBuffer=[Derivative_DATA_BUFFER_SIZE];
 int pitchBufferIndex = 0;
+int smoothed_dataIndex = 0;
+int  adc1BufferIndex = 0;
+int  adc2BufferIndex = 0;
 
+int oscillationCounter = 0;
 #define WINDOW_SIZE 3 // Size of the filtering window (odd number)
 #define POLY_DEGREE 2 // Degree of the fitting polynomial
 
@@ -129,6 +143,8 @@ static float motor_temp_limit;
 // Runtime values read from elsewhere
 static float pitch_angle, last_pitch_angle, roll_angle, abs_roll_angle, abs_roll_angle_sin, last_gyro_y;
 static float gyro[3];
+static float accel[3];
+static float erpm_per_second;
 static float duty_cycle, abs_duty_cycle;
 static float erpm, abs_erpm, avg_erpm;
 static float motor_current;
@@ -168,7 +184,7 @@ static float max_motor_current;
 static float pitch_filtered;
 static float last_pitch_filtered;
 static float last_torquetilt_filtered_current;
-static float ReadSensorTimeStamp;
+static float ReadSensorTimeStamp;//maybe this should be a uint32_t
 //static float average_pitch_angle;
 //static float centralDifference;
 static float dt_check;
@@ -183,6 +199,9 @@ static float Kk1;
 static float Xk;
 static float Kk;
 static float last_Xk;
+static float last_Xk2;
+static float Xk2;
+static float Kk2;
 static float last_proportional_filtered;
 static float proportional_filtered;
 static float adc_lowpass_k;
@@ -190,6 +209,64 @@ static float adc1_lowpass_state;
 static float adc2_lowpass_state;
 static float adc1_filtered ;
 static float adc2_filtered ;
+
+
+//static float ramp_rate;
+//static bool ramping;
+// Apply a broad Kalman filter 
+static float x_est1;
+static float Q1 =1000;//= .0042 ;   //first .0042; //.005 //0.022;			//the noise in the system
+
+static float R1=1000; //=    0.7   ;  //first.7; //0.617;					//the noise in the system
+
+static float K1;
+static float P1;
+static float P_temp1;// = 1.0e6;
+static float x_temp_est1; // Initial estimate
+static float x_est_last1;
+static float P_last1;//= 1.0e6;
+static float z_measured1; //the 'noisy' value we measured	
+
+
+//smaller Q and larger R work together, opposite is true.
+// Apply a broad Kalman filter number 2
+static float Q2=500; //= .08;//.08; //.08 //.1 //0.022;			//the noise in the system
+//tried initial value of .08, then went to .002. .002 feels okay riding but is unstable without a rider.??
+// .2 is too noisy but has fast response
+//.1 is noisy but has fast response
+static float R2 =500;//= 1;// 1; //0.617;	//the noise in the system
+//tried initial value of 1, then went to 0.617 0.617 feels okay riding but is unstable without a rider.
+//1 is noisy but has fast response
+//.9 is noisy but has fast response
+//3 is very noisy R2 value
+static float K2;
+static float P2;
+static float P_temp2;
+static float x_temp_est2;
+static float x_est2;
+static float x_est_last2;
+static float P_last2;
+static float z_measured2; //the 'noisy' value we measured	
+
+
+static float Q3 = 1;//.08; //.08 //.1 //0.022;			//the noise in the system
+//tried initial value of .08, then went to .002. .002 feels okay riding but is unstable without a rider.??
+// .2 is too noisy but has fast response
+//.1 is noisy but has fast response
+static float R3 =6;// 1; //0.617;	//the noise in the system
+//tried initial value of 1, then went to 0.617 0.617 feels okay riding but is unstable without a rider.
+//1 is noisy but has fast response
+//.9 is noisy but has fast response
+//3 is very noisy R2 value
+static float K3;
+static float P3;
+static float P_temp3;
+static float x_temp_est3;
+static float x_est3;
+static float x_est_last3;
+static float P_last3;
+static float z_measured3; //the 'noisy' value we measured	
+
 
 static float roll_angle_filtered;
 static float roll_angle_lowpass_state;
@@ -269,12 +346,12 @@ void app_balance_configure(balance_config *conf, imu_config *conf2) {
 		biquad_config(&torquetilt_current_biquad, BQ_LOWPASS, Fc);
 	}
 
-	// Alex changes. Added filter init for ADC switches. Still need to test.
-	if(balance_conf.yaw_current_clamp > 0){
-		float dT = 1.0 / balance_conf.hertz;
-		float RC = 1.0 / ( 2.0 * M_PI * balance_conf.yaw_current_clamp);
-		adc_lowpass_k =  dT / (RC + dT);
-	}
+	// // Alex changes. Added filter init for ADC switches. Still need to test.
+	// if(balance_conf.yaw_current_clamp > 0){
+	// 	float dT = 1.0 / balance_conf.hertz;
+	// 	float RC = 1.0 / ( 2.0 * M_PI * balance_conf.yaw_current_clamp);
+	// 	adc_lowpass_k =  dT / (RC + dT);
+	// }
 
 
 	if(balance_conf.roll_steer_erpm_kp > 0){
@@ -404,18 +481,67 @@ static void reset_vars(void){
 	motor_temp_limit=mc_interface_get_configuration()->l_temp_motor_start;
 	roll_angle_filtered = 0;
 	roll_angle_lowpass_state = 0;
+	//pid_value_1=0;
+	//pid_value=0;
+	derivative2=0.1;
 	//app_nunchuk_get_decoded_y()=0;
 
 }
 // Function to apply a simple moving average filter
 
 
-// 	static float simpleMovingAverage(float *buffer, int length) {
-//     float sum = 0;
-//     for (int i = 0; i < length; i++) {
-//         sum += buffer[i];
-//     }
-//     return sum / length;
+	static float simpleMovingAverage(float *buffer, int length) {
+    float sum = 0;
+    for (int i = 0; i < length; i++) {
+        sum += buffer[i];
+    }
+    return sum / length;
+}
+
+// static void apply_kalman(float d){
+	
+// 	// Apply a broad Kalman filter 
+// 	float Q1 = .0042; //.005 //0.022;			//the noise in the system
+// 	float R1 = .7; //0.617;					//the noise in the system
+// 	float K1;
+// 	float P1;
+// 	float P_temp1 = 1.0e6;
+// 	float x_temp_est1=d; // Initial estimate
+     
+	
+// 	float x_est_last1 =d;
+// 	float P_last1= 1.0e6;
+// 	float z_measured1; //the 'noisy' value we measured	
+// 	x_temp_est1 = x_est_last1; 			//do a prediction
+// 	P_temp1 = P_last1 + Q1;
+// 	K1 = P_temp1 * (1.0/(P_temp1 + R1));		//calculate the Kalman gain
+// 	z_measured1 = d;					//measure
+// 	x_est1 = x_temp_est1 + K1 * (z_measured1 - x_temp_est1); 	//correct
+// 	P1 = (1- K1) * P_temp1;
+// 	P_last1 = P1;			//update our last's
+// 	x_est_last1 = x_est1;		//update our last's
+// }
+// 	//Apply a more precise filter for pitch velocity
+// 	float Q2 = .08; //.08 //.1 //0.022;			//the noise in the system
+// 	float R2 = 1; //0.617;	//the noise in the system
+// 	float K2;
+// 	float P2;
+// 	float P_temp2;
+// 	float x_temp_est2;
+// 	float x_est2;
+// 	float x_est_last2;
+// 	float P_last2;
+// 	float z_measured2; //the 'noisy' value we measured	
+// 	x_temp_est2 = x_est_last2; 			//do a prediction
+// 	P_temp2 = P_last2 + Q2;
+// 	K2 = P_temp2 * (1.0/(P_temp2 + R2));		//calculate the Kalman gain
+// 	z_measured2 =pitch - last_pitch_angle;		//measure
+// 	x_est2 = x_temp_est2 + K2 * (z_measured2 - x_temp_est2); 	//correct
+// 	P2 = (1- K2) * P_temp2;
+// 	 P_last2 = P2;			//update our last's
+// 	x_est_last2 = x_est2;		//update our last's			
+
+// 	float prop_smooth = x_est1 + x_est2 * 0.9;	//smoothed d->proportional, plus an estimate for the next step based on smoothed pitch speed	
 // }
 
 
@@ -479,6 +605,35 @@ static bool check_faults(bool ignoreTimers){
 	} else {
 		fault_switch_timer = current_time;
 	}
+
+	// if(switch_state == OFF){
+	// 	if (erpm_filtered  > balance_conf.turntilt_start_erpm  && last_erpm_filtered < -balance_conf.turntilt_start_erpm ) {
+	// 		oscillationCounter++;
+	// 	} else if (erpm_filtered < -balance_conf.turntilt_start_erpm  && last_erpm_filtered > balance_conf.turntilt_start_erpm ) {
+	// 		oscillationCounter++;
+	// 	} else {
+	// 		oscillationCounter = 0;
+	// 	}
+
+	// 	if (oscillationCounter >= balance_conf.turntilt_erpm_boost) {
+	// 		state = FAULT_SWITCH_FULL;
+	// 		return true;
+	// 	}
+	// 	if(ST2MS(current_time - fault_switch_timer) > balance_conf.fault_delay_switch_full || ignoreTimers){
+	// 		state = FAULT_SWITCH_FULL;
+	// 		return true;
+	// 	}
+	// } else {
+	// 	fault_switch_timer = current_time;
+	// }
+
+
+
+
+
+
+
+
 
 	// Switch partially open and stopped
 	if(!balance_conf.fault_is_dual_switch) {
@@ -679,6 +834,7 @@ static void apply_noseangling(void){
 // 		turntilt_target = 0;
 // 	}
 
+
 // 	// Disable below erpm threshold otherwise add directionality
 // 	if(abs_erpm < balance_conf.turntilt_start_erpm){
 // 		turntilt_target = 0;
@@ -832,36 +988,108 @@ static THD_FUNCTION(balance_thread, arg) {
 		last_rpm_filtered=rpm_filtered;
 		last_duty_cycle=duty_cycle;
 		last_Xk=Xk;
+		last_Xk2=Xk2;
 		last_proportional_filtered=proportional_filtered;
 		last_LP_pitch=LP_pitch;
 		last_derivative2_filtered=derivative2_filtered;
+
+		x_temp_est1 = x_est_last1; 			//do a prediction
+		x_est_last1 = x_est1;		//update our last's
+		P_last1 = P1;	
+				//update our last's
+		P_temp1 = P_last1 + Q1;
+		//P_temp1 = P_last1 + balance_conf.kd2;
+	
+		//Q2=balance_conf.yaw_kp;
+
+		x_temp_est2 = x_est_last2; 			//do a prediction
+		
+		//P_temp2 = P_last2 + balance_conf.yaw_kp;
+		P_temp2 = P_last2 + Q2;
+		
+		P_last2 = P2;			//update our last's
+		x_est_last2 = x_est2;		//update our last's		
+
+		x_temp_est3 = x_est_last3; 			//do a prediction
+		P_temp3 = P_last3 + Q3;
+		P_last3 = P3;			//update our last's
+		x_est_last3 = x_est3;		//update our last's		
+
 		// Get the values we want
 		float dt = UTILS_AGE_S(ReadSensorTimeStamp); //time elapsed since last sensor read, in seconds.
 		dt_check=dt;
 		ReadSensorTimeStamp = chVTGetSystemTimeX();
 		pitch_angle = RAD2DEG_f(imu_get_pitch());	//read pitch from sensor cache in AHRS lib
-
-		
 		
 
 
+	
+
+		UTILS_LP_FAST(accel[0], accel[0], 0.05);
+		// 	// Filter RPM to avoid glitches
+		// static float rpm_filtered = 0.0;
+		// UTILS_LP_MOVING_AVG_APPROX(rpm_filtered, mc_interface_get_rpm(), RPM_FILTER_SAMPLES);
+			//UTILS_LP_FAST_APPROX(rpm_filtered, mc_interface_get_rpm(), RPM_FILTER_SAMPLES);
+		
+		
 		// pitchAngleBuffer[pitchBufferIndex] = pitch_angle;
 		// pitchBufferIndex = (pitchBufferIndex + 1) % DATA_BUFFER_SIZE;
-		// Apply the higher-order low-pass filter
-		//LP_pitch = higherOrderLowPassFilter(pitch_angle, pitchAngleBuffer, ORDER);
+		// // // Apply simple moving average
+		// pitch_angle=simpleMovingAverage( pitchAngleBuffer , DATA_BUFFER_SIZE);
+		
+	
+		// if(balance_conf.kd2 > 0){
+		// pitchAngleBuffer[pitchBufferIndex] = pitch_angle;
+		// pitchBufferIndex = (pitchBufferIndex + 1) % DATA_BUFFER_SIZE;
+		// // // Apply simple moving average
+		// pitch_angle=simpleMovingAverage( pitchAngleBuffer , DATA_BUFFER_SIZE);
+				
+		// 		} else {
+		// 			pitch_angle = pitch_angle;
+		// 		}	
 
-		// pitch_angle=LP_pitch;
-		//pitch_angle=simpleMovingAverage( pitchAngleBuffer , DATA_BUFFER_SIZE);
+
+
+
+
+
+	
+
+		adc1Buffer[adc1BufferIndex] = adc1;
+		adc1BufferIndex = (adc1BufferIndex + 1) % ADC1_BUFFER_SIZE;
+		// Apply simple moving average
+		adc1=simpleMovingAverage( adc1Buffer , ADC1_BUFFER_SIZE);
 		
+		adc2Buffer[adc2BufferIndex] = adc2;
+		adc2BufferIndex = (adc2BufferIndex + 1) % ADC2_BUFFER_SIZE;
+		// Apply simple moving average
+		adc2=simpleMovingAverage( adc2Buffer , ADC2_BUFFER_SIZE);
 		
+
 
 		roll_angle = RAD2DEG_f(imu_get_roll());
 		abs_roll_angle = fabsf(roll_angle);
 		abs_roll_angle_sin = sinf(DEG2RAD_f(abs_roll_angle));
 		imu_get_gyro(gyro);
+		imu_get_accel(accel);
 		duty_cycle = mc_interface_get_duty_cycle_now();
 		abs_duty_cycle = fabsf(duty_cycle);
 		erpm = mc_interface_get_rpm();
+
+
+		// smoothed_data[Derivative_DATA_BUFFER_SIZE]=erpm; // 
+		// smoothed_dataIndex =  (smoothed_dataIndex + 1) % Derivative_DATA_BUFFER_SIZE;
+		// erpm_filtered=simpleMovingAverage(smoothed_data , Derivative_DATA_BUFFER_SIZE);
+		//UTILS_LP_FAST(erpm_filtered, erpm, 0.05);
+
+		smoothed_data[smoothed_dataIndex]=erpm; // 
+		smoothed_dataIndex =  (smoothed_dataIndex + 1) % Derivative_DATA_BUFFER_SIZE;
+		erpm_filtered=simpleMovingAverage(smoothed_data , Derivative_DATA_BUFFER_SIZE);
+
+		erpm_per_second = (erpm_filtered - last_erpm_filtered) / dt;
+
+		// UTILS_LP_FAST(erpm_per_second,erpm_per_second, 0.05);
+		
 		abs_erpm = fabsf(erpm);
 		if(balance_conf.multi_esc){
 			avg_erpm = erpm;
@@ -971,16 +1199,65 @@ static THD_FUNCTION(balance_thread, arg) {
 				// } else {
 				// 	pitch_filtered = pitch_angle;
 				// }	
-				pitch_filtered = pitch_angle;
+
+			
+				// reusing variable for kalman filters tuning for now.
+				//Q1= balance_conf.kd2;
+				//R1=balance_conf.yaw_ki;
+				
+
+
+
+				// if(balance_conf.kd_pt1_lowpass_frequency > 0){
+				// //x_temp_est1 = x_est_last1; 			//do a prediction
+				// //P_temp1 = P_last1 + Q1;
+				// K1 = P_temp1 * (1.0/(P_temp1 +balance_conf.yaw_ki));		//calculate the Kalman gain
+				// z_measured1 = pitch_angle;					//measure
+				// x_est1 = x_temp_est1 + K1 * (z_measured1 - x_temp_est1); 	//correct
+				// P1 = (1- K1) * P_temp1;
+				// //P_last1 = P1;			//update our last's
+				// //x_est_last1 = x_est1;		//update our last's
+				// pitch_filtered = x_est1;
+				// } else {
+				// 	pitch_filtered = pitch_angle;
+				// }	
+
+				
+
+
+				if(balance_conf.kd_pt1_lowpass_frequency > 0){
+				//x_temp_est1 = x_est_last1; 			//do a prediction
+				//P_temp1 = P_last1 + Q1;
+				K1 = P_temp1 * (1.0/(P_temp1 + R1));		//calculate the Kalman gain
+				z_measured1 = pitch_angle;					//measure
+				x_est1 = x_temp_est1 + K1 * (z_measured1 - x_temp_est1); 	//correct
+				P1 = (1- K1) * P_temp1;
+				//P_last1 = P1;			//update our last's
+				//x_est_last1 = x_est1;		//update our last's
+				pitch_filtered = x_est1;
+				} else {
+					pitch_filtered = pitch_angle;
+				}	
+
+				
+
+
+
+
+				//pitch_filtered = pitch_angle;
 				// See
 				// http://math.stackexchange.com/questions/297768/how-would-i-create-a-exponential-ramp-function-from-0-0-to-1-1-with-a-single-val
 
 				// Alex Changes. Added non linear term to output. Note for test setup, ki and kp are reversed in the throttle curve function to get the desired output. 
 				// Otherwise, in the app, kp would be for braking and ki is for throttle. Just semantics but easier to think about on the fly for now.
 				
-				if(balance_conf.yaw_kd > -1){
-					pitch_filtered = utils_throttle_curve(pitch_filtered, balance_conf.yaw_ki, balance_conf.yaw_kp, balance_conf.yaw_kd);
+				//if(balance_conf.yaw_current_clamp < 3){
+					//pitch_filtered = utils_throttle_curve(pitch_filtered, balance_conf.yaw_current_clamp, balance_conf.roll_steer_kp, balance_conf.roll_steer_erpm_kp);
 					//pitch_filtered = utils_throttle_curve(pitch_filtered, balance_conf.yaw_kp, balance_conf.yaw_ki, balance_conf.yaw_kd)*balance_conf.roll_steer_kp;
+
+
+				if(balance_conf.yaw_kd > -1){
+					pitch_filtered = utils_throttle_curve(pitch_filtered, balance_conf.yaw_ki, balance_conf.yaw_kp, balance_conf.yaw_kd);	
 				} else {
 					pitch_filtered = pitch_angle;
 				}	
@@ -1001,15 +1278,15 @@ static THD_FUNCTION(balance_thread, arg) {
 				if(balance_conf.ki_limit > 0 && fabsf(integral * balance_conf.ki) > balance_conf.ki_limit){
 					integral = balance_conf.ki_limit / balance_conf.ki * SIGN(integral);
 				}
-
-
-
-				//float previousValues[ORDER] = {0};
+				
 
 				
-				derivative = (LP_pitch-last_LP_pitch) / ((dt*2));
+				//float previousValues[ORDER] = {0};
 
+				//derivative=pitch_angle += 0.5 * (gyro[1] + last_gyro_y) * dt;
+				
 
+							
 				// An implementation of the recursive estimator (Kalman filter) described here:
 
 				//https://kuscholarworks.ku.edu/bitstream/handle/1808/14535/Lindsey_ku_0099M_13455_DATA_1.pdf;sequence=1
@@ -1066,6 +1343,13 @@ static THD_FUNCTION(balance_thread, arg) {
 				// *after test notes 5-6-23* this derivative seems to be better than the first version in practice.
 				
 
+
+				// if(balance_conf.kd_pt1_highpass_frequency > 0){
+				// apply_kalman(pitch_angle); // Apply Kalman filter to 'pitch_angle'
+				// pitch_angle = x_est1;
+				// } else {
+				// 	pitch_angle = pitch_angle;
+				// }	
 			
 
 
@@ -1074,7 +1358,7 @@ static THD_FUNCTION(balance_thread, arg) {
 
 
 
-				Kk= (balance_conf.kp2);
+				Kk= (balance_conf.kp2/1000);
 				if(Kk > 0){
 				Xk= Kk*pitch_angle +(1-Kk)*(last_Xk);
 				} else {
@@ -1084,21 +1368,62 @@ static THD_FUNCTION(balance_thread, arg) {
 				derivative2 = (Xk-last_Xk) / ((dt*2));// calculate derivative using pitch angle difference and time difference.
 				
 				//Apply Proportional filters for derivative term 
-				if(balance_conf.kd_pt1_lowpass_frequency > 0){
-					d_pt1_lowpass_state = d_pt1_lowpass_state + d_pt1_lowpass_k * (derivative2 - d_pt1_lowpass_state);
-					derivative2 = d_pt1_lowpass_state;
-				} else {
-					derivative2 = derivative2;
-				}	
+				// if(balance_conf.kd_pt1_lowpass_frequency > 0){
+				// 	d_pt1_lowpass_state = d_pt1_lowpass_state + d_pt1_lowpass_k * (derivative2 - d_pt1_lowpass_state);
+				// 	derivative2 = d_pt1_lowpass_state;
+				// } else {
+				// 	derivative2 = derivative2;
+				// }	
 				
 
-				Kk1= (balance_conf.ki2);
+				Kk1= (balance_conf.ki2/1000);
 				if(Kk1> 0){
-				derivative2_filtered=Kk1*derivative2*0.001 +(1-Kk1*0.001)*(last_derivative2_filtered);
+				derivative2_filtered=Kk1*derivative2 +(1-Kk1)*(last_derivative2_filtered);
 				derivative2=derivative2_filtered;
 				} else {
 					derivative2 = derivative2;
 				}
+				
+
+				
+				//R2=balance_conf.yaw_kd;
+				
+
+				// 	if(balance_conf.kd_pt1_highpass_frequency > 0){
+				// K2 = P_temp2 * (1.0/(P_temp2 + balance_conf.yaw_kd));		//calculate the Kalman gain
+				// z_measured2 =derivative2;		//measure
+				// x_est2 = x_temp_est2 + K2 * (z_measured2 - x_temp_est2); 	//correct
+				// P2 = (1- K2) * P_temp2;
+				// derivative2=x_est2;
+				// } else {
+				// 	derivative2 = derivative2;
+				// }
+
+				if(balance_conf.kd_pt1_highpass_frequency > 0){
+				K2 = P_temp2 * (1.0/(P_temp2 + R2));		//calculate the Kalman gain
+				z_measured2 =derivative2;		//measure
+				x_est2 = x_temp_est2 + K2 * (z_measured2 - x_temp_est2); 	//correct
+				P2 = (1- K2) * P_temp2;
+				derivative2=x_est2;
+				} else {
+					derivative2 = derivative2;
+				}
+				
+				//derivative2 = MIN(MAX(derivative2, -balance_conf.yaw_current_clamp), balance_conf.yaw_current_clamp);
+
+
+
+				// if(balance_conf.kd2 > 0){
+				// pitchAngleBuffer[pitchBufferIndex] = derivative2;
+				// pitchBufferIndex = (pitchBufferIndex + 1) % DATA_BUFFER_SIZE;
+				// // // Apply simple moving average
+				// derivative2=simpleMovingAverage( pitchAngleBuffer , DATA_BUFFER_SIZE);
+						
+				// } else {
+				// 	derivative2 = derivative2;
+				// }	
+
+				
 
 
 				// Alex changes. Not using the lowpass filters for D term.
@@ -1122,23 +1447,75 @@ static THD_FUNCTION(balance_thread, arg) {
 				// on the convention of your IMU, this may need to be removed. I need to come up with a foolproof way to fix this in the future, assuming that the second method for the derrivative term is better.
 				// If not, then I will just remove the second derivative term altogether.
 
-				pid_value_1= (balance_conf.kp * proportional) + (balance_conf.ki * integral) + (balance_conf.kd * derivative) + ((-1)*balance_conf.kd2 * derivative2); 
+				//+((1)*balance_conf.roll_steer_kp * derivative)
+
+
+
+
+				pid_value_1= (balance_conf.kp * proportional) + (balance_conf.ki * integral)  +((-1)*balance_conf.kd * derivative2); 
 																															//WARNING: be aware that this -1 may need to be removed depending on the convention of your IMU.
 																															// If you get this wrong, the controller WILL be unstable.
 				
+				
+				// if(balance_conf.kd_pt1_highpass_frequency > 0){
+				// 	d_pt1_highpass_state = d_pt1_highpass_state + d_pt1_highpass_k * (pid_value_1 - d_pt1_highpass_state);
+				// 	pid_value = d_pt1_highpass_state;
+				// } else {
+				//  pid_value=pid_value_1;
+				// }	
+				 //pid_value=pid_value_1;
 
-				if(balance_conf.kd_pt1_highpass_frequency > 0){
-					d_pt1_highpass_state = d_pt1_highpass_state + d_pt1_highpass_k * (pid_value_1 - d_pt1_highpass_state);
-					pid_value = d_pt1_highpass_state;
-				} else {
-				 pid_value=pid_value_1;
-				}	
+				// Kk2= (balance_conf.kd2/1000);
+				// if(Kk2 > 0){
+				// Xk2= Kk2*pid_value_1 +(1-Kk2)*(last_Xk2);
+				// pid_value=Xk2;
+				// } else {
+				//  pid_value=pid_value_1;
+				// }	
+
+				// if(balance_conf.kd2 > 0){
+				// K3 = P_temp3 * (1.0/(P_temp3 + R3));		//calculate the Kalman gain
+				// z_measured3 =pid_value_1;		//measure
+				// x_est3 = x_temp_est3 + K3 * (z_measured3 - x_temp_est3); 	//correct
+				// P3 = (1- K3) * P_temp3;
+				// pid_value=x_est3;
+				// } else {
+				// 	pid_value = pid_value_1;
+				// }
+
+				
+				// if(balance_conf.kd2>0){
+				// if((erpm_per_second*balance_conf.turntilt_strength*balance_conf.turntilt_start_erpm*balance_conf.roll_steer_kp)/2000000>accel[0]){
+				// 	pid_value=balance_conf.turntilt_angle_limit*pid_value_1;
+				// }
+				// if(-(erpm_per_second*balance_conf.turntilt_strength*balance_conf.turntilt_start_erpm*balance_conf.roll_steer_erpm_kp)/2000000<-accel[0]){
+				// 	pid_value=balance_conf.turntilt_angle_limit*pid_value_1;
+				// }
+				// }else{
+				// 	pid_value=pid_value_1;
+				// }
+				
+				if(balance_conf.kd2>0){
+				if(erpm_filtered>1000 && (erpm_per_second*balance_conf.turntilt_strength*balance_conf.turntilt_start_erpm*balance_conf.roll_steer_kp)/2000000>balance_conf.turntilt_erpm_boost_end){
+					pid_value=pid_value_1*balance_conf.yaw_current_clamp;
+				}else{
+				pid_value=pid_value_1;
+				}
+				}else{
+					pid_value=pid_value_1;
+				}
+				// if(-(erpm_per_second*balance_conf.turntilt_strength*balance_conf.turntilt_start_erpm*balance_conf.roll_steer_erpm_kp)/2000000<-balance_conf.turntilt_erpm_boost_end){
+				// 	pid_value=balance_conf.turntilt_angle_limit*pid_value_1;
+				// }
+				
+				
 
 
-	
+				//pid_value=MIN(pid_value, max_motor_current);
+				pid_value = MIN(MAX(pid_value, -max_motor_current), max_motor_current);
 
-
-
+				
+				
 				// if(balance_conf.pid_mode == BALANCE_PID_MODE_ANGLE_RATE_CASCADE){
 				// 	proportional2 = pid_value - gyro[1];
 				// 	integral2 = integral2 + proportional2;
@@ -1194,13 +1571,41 @@ static THD_FUNCTION(balance_thread, arg) {
 				// imu_angle_exp_brake=balance_conf.yaw_ki ; 
 				// imu_angle_exp_mode=balance_conf.yaw_kd;   
 				
-				
+		
 
 				// if(balance_conf.yaw_kd > -1){
 				// 	pid_value = utils_throttle_curve(pid_value, balance_conf.yaw_kp, balance_conf.yaw_ki, balance_conf.yaw_kd);
 				// 	pid_value = pid_value*max_motor_current;
 				// }	
 
+				
+
+				//balance_conf.turntilt_start_erpm                /// double velocityThreshold = 5.0;         // Adjust this threshold as needed
+				//balance_conf.turntilt_erpm_boost_end // int rapidOscillationThreshold = 5; // Adjust as needed
+				
+				
+
+
+				// Replace this with actual code to read motor velocity
+				// For example, if you're using an encoder:
+				
+					// //balance_conf.turntilt_strength
+					
+					// if (erpm_filtered  > balance_conf.turntilt_start_erpm  && last_erpm_filtered < -balance_conf.turntilt_start_erpm ) {
+					// 	oscillationCounter++;
+					// } else if (erpm_filtered < -balance_conf.turntilt_start_erpm  && last_erpm_filtered > balance_conf.turntilt_start_erpm ) {
+					// 	oscillationCounter++;
+					// } else {
+					// 	oscillationCounter = 0;
+					// }
+
+					// if (oscillationCounter >= balance_conf.turntilt_erpm_boost) {
+					// 	pid_value=0;
+					// } else {
+					// 	pid_value=pid_value;
+					// }
+					
+					
 				// Output to motor
 				set_current(pid_value, yaw_pid_value);
 				break;
@@ -1208,6 +1613,23 @@ static THD_FUNCTION(balance_thread, arg) {
 			case (FAULT_ANGLE_ROLL):
 			case (FAULT_SWITCH_HALF):
 			case (FAULT_SWITCH_FULL):
+					// if (erpm_filtered  > balance_conf.turntilt_start_erpm  && last_erpm_filtered < -balance_conf.turntilt_start_erpm ) {
+					// 	oscillationCounter++;
+					// } else if (erpm_filtered < -balance_conf.turntilt_start_erpm  && last_erpm_filtered > balance_conf.turntilt_start_erpm ) {
+					// 	oscillationCounter++;
+					// } else {
+					// 	oscillationCounter = 0;
+					// }
+
+					// if (oscillationCounter >= balance_conf.turntilt_erpm_boost) {
+					// break;
+					// //brake();
+					// }
+					// else {
+					// 	break;
+					// }
+					// break;
+
 			case (FAULT_STARTUP):
 				// Check for valid startup position and switch state
 				if(fabsf(pitch_angle) < balance_conf.startup_pitch_tolerance && fabsf(roll_angle) < balance_conf.startup_roll_tolerance && switch_state == ON){
@@ -1322,7 +1744,7 @@ static float app_balance_get_debug(int index){
 		case(3):
 			return pitch_angle;
 		case(4):
-			return LP_pitch;
+			return pitch_filtered;
 		case(5):
 			return last_pitch_angle - pitch_angle;
 		case(6):
@@ -1342,13 +1764,13 @@ static float app_balance_get_debug(int index){
 		case(13):
 			return filtered_diff_time;
 		case(14):
-			return integral;
+			return balance_conf.turntilt_erpm_boost_end;
 		case(15):
-			return integral * balance_conf.ki;
+			return erpm_per_second;
 		case(16):
-			return integral2;
+			return accel[0];
 		case(17):
-			return integral2 * balance_conf.ki2;
+			return erpm_per_second*balance_conf.turntilt_strength*balance_conf.turntilt_start_erpm*balance_conf.roll_steer_kp/2000000;
 		default:
 			return 0;
 	}
